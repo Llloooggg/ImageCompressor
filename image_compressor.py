@@ -22,7 +22,7 @@ logging.basicConfig(
     format="%(asctime)s - %(message)s",
 )
 
-MIN_SIZE = 1.5 * 1024 * 1024
+MIN_SIZE = 2 * 1024 * 1024
 TARGET_SIZE_MB = 1.5 * 1024 * 1024
 MAX_WORKERS = min(32, (multiprocessing.cpu_count() or 1) * 5)
 
@@ -155,7 +155,6 @@ def compress_with_external(path: str, ext: str) -> bool:
 
 
 def compress_with_pillow(path: str) -> bool:
-    ext = Path(path).suffix.lower()
     original_size = os.path.getsize(path)
     target_size = TARGET_SIZE_MB
     temp_path = Path(path).with_suffix(".pillowtmp")
@@ -197,6 +196,8 @@ def compress_image(path: str, fallback_to_pillow: bool = False):
         original_size = os.path.getsize(path)
         if original_size < MIN_SIZE:
             skipped_count += 1
+            msg = f"Пропущено (уже малый): {path} ({original_size / 1024:.1f} KB)"
+            logging.info(msg)
             return
 
         h = file_hash(path)
@@ -204,6 +205,8 @@ def compress_image(path: str, fallback_to_pillow: bool = False):
             cursor.execute("SELECT 1 FROM processed WHERE hash = ?", (h,))
             if cursor.fetchone():
                 skipped_count += 1
+                msg = f"Пропущено (уже сжато): {path} ({original_size / 1024:.1f} KB)"
+                logging.info(msg)
                 return
 
         ext = Path(path).suffix.lower()
