@@ -90,6 +90,8 @@ def compress_with_external(path: str, ext: str) -> bool:
                         str(path),
                     ],
                     check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
                 )
                 if os.path.getsize(tmp_path) <= target_size:
                     break
@@ -109,6 +111,8 @@ def compress_with_external(path: str, ext: str) -> bool:
                         str(path),
                     ],
                     check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
                 )
                 if os.path.getsize(tmp_path) <= target_size or quality < 50:
                     break
@@ -135,6 +139,8 @@ def compress_with_external(path: str, ext: str) -> bool:
                         "all",
                     ],
                     check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
                 )
                 if os.path.getsize(tmp_path) <= target_size or quality < 50:
                     break
