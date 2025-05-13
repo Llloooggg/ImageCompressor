@@ -23,7 +23,7 @@ logging.basicConfig(
 )
 
 MIN_SIZE = 2 * 1024 * 1024
-TARGET_SIZE_MB = 1.5 * 1024 * 1024
+TARGET_SIZE_MB = 2 * 1024 * 1024
 MAX_WORKERS = min(32, (multiprocessing.cpu_count() or 1) * 5)
 
 DB_PATH = "image_compressor.db"
