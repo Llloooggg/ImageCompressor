@@ -13,7 +13,6 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
-
 warnings.filterwarnings("ignore", category=UserWarning, module="PIL")
 
 logging.basicConfig(
@@ -71,47 +70,48 @@ def inject_exif(jpeg_path, exif_bytes):
         logging.error(f"Ошибка при вставке EXIF в {jpeg_path}: {e}")
 
 
-def convert_png_to_jpeg(path: str) -> bool:
+def convert_png_to_jpeg(path: Path) -> Path | None:
     try:
+        temp_path = path.with_suffix(".jpg")
         with Image.open(path) as img:
-            temp_path = path.with_suffix(".jpg")
             img.convert("RGB").save(
                 temp_path, "JPEG", quality=85, optimize=True
             )
-
-            new_size = temp_path.stat().st_size
-            if new_size < path.stat().st_size:
-                temp_path.replace(path)
-                return True
+        if temp_path.stat().st_size < path.stat().st_size:
+            path.unlink()
+            return temp_path
+        else:
+            temp_path.unlink()
     except Exception as e:
         logging.error(f"Ошибка при конвертации PNG в JPEG для {path}: {e}")
-    return False
+    return None
 
 
-def compress_with_external(path: str, ext: str) -> bool:
+def compress_with_external(path: str, ext: str) -> tuple[bool, Path]:
     path = Path(path)
     original_size = path.stat().st_size
-    tmp_path = path.with_name(path.name + ".compressed")
+    tmp_path = path.with_name(path.stem + ".compressed" + path.suffix)
     target_size = TARGET_SIZE_MB
 
     try:
         if ext == ".png":
-            if not convert_png_to_jpeg(path):
-                return False
+            new_path = convert_png_to_jpeg(path)
+            if not new_path:
+                return False, path
+            path = new_path
             ext = ".jpg"
 
         if ext in [".jpg", ".jpeg"]:
             exif_data = extract_exif(path)
-
             tool = get_tool_path("cjpeg-static.exe")
             quality = 85
             while True:
                 subprocess.run(
                     [
                         tool,
-                        f"-quality",
+                        "-quality",
                         str(quality),
-                        f"-outfile",
+                        "-outfile",
                         str(tmp_path),
                         str(path),
                     ],
@@ -122,7 +122,6 @@ def compress_with_external(path: str, ext: str) -> bool:
                 if os.path.getsize(tmp_path) <= target_size or quality < 50:
                     break
                 quality -= 5
-
             if tmp_path.exists() and exif_data:
                 inject_exif(tmp_path, exif_data)
 
@@ -151,31 +150,33 @@ def compress_with_external(path: str, ext: str) -> bool:
                     break
                 quality -= 5
         else:
-            return False
+            return False, path
     except FileNotFoundError:
-        return None
+        return None, path
+    except Exception as e:
+        logging.error(f"Ошибка внешнего сжатия {path}: {e}")
+        return False, path
 
     if tmp_path.exists():
-        new_size = os.path.getsize(tmp_path)
+        new_size = tmp_path.stat().st_size
         if new_size < original_size:
             tmp_path.replace(path)
-            return True
+            return True, path
         else:
             tmp_path.unlink()
-    return False
+    return False, path
 
 
-def compress_with_pillow(path: str) -> bool:
-    original_size = os.path.getsize(path)
-    target_size = TARGET_SIZE_MB
-    temp_path = Path(path).with_suffix(".pillowtmp")
+def compress_with_pillow(path: str) -> tuple[bool, Path]:
+    path = Path(path)
+    original_size = path.stat().st_size
+    temp_path = path.with_name(path.stem + ".pillowtmp" + path.suffix)
 
     try:
         with Image.open(path) as img:
             img_format = img.format
             exif = img.info.get("exif", None)
             quality = 85
-
             while quality >= 50:
                 img.save(
                     temp_path,
@@ -184,73 +185,72 @@ def compress_with_pillow(path: str) -> bool:
                     quality=quality,
                     exif=exif,
                 )
-                if temp_path.stat().st_size <= target_size:
+                if temp_path.stat().st_size <= TARGET_SIZE_MB:
                     break
                 quality -= 5
 
         if temp_path.exists() and temp_path.stat().st_size < original_size:
             temp_path.replace(path)
-            return True
+            return True, path
         elif temp_path.exists():
             temp_path.unlink()
-            return False
-
+            return False, path
     except Exception as e:
         logging.error(f"Ошибка Pillow для {path}: {e}")
-        return False
+    return False, path
 
 
 def compress_image(path: str, fallback_to_pillow: bool = False):
     global processed_count, skipped_count, total_saved_bytes
 
     try:
-        original_size = os.path.getsize(path)
+        path = Path(path)
+        original_size = path.stat().st_size
         if original_size < MIN_SIZE:
             skipped_count += 1
-            msg = f"Пропущено (уже малый): {path} ({original_size / 1024:.1f} KB)"
-            logging.info(msg)
+            logging.info(
+                f"Пропущено (уже малый): {path} ({original_size / 1024:.1f} KB)"
+            )
             return
 
         h = file_hash(path)
-        filename = path.name
         with db_lock:
             cursor.execute("SELECT 1 FROM processed WHERE hash = ?", (h,))
             if cursor.fetchone():
                 skipped_count += 1
-                msg = f"Пропущено (уже сжато): {path} ({original_size / 1024:.1f} KB)"
-                logging.info(msg)
+                logging.info(
+                    f"Пропущено (уже сжато): {path} ({original_size / 1024:.1f} KB)"
+                )
                 return
 
-        ext = Path(path).suffix.lower()
-        result = compress_with_external(path, ext)
+        ext = path.suffix.lower()
+        result, path = compress_with_external(path, ext)
 
         if result is None and fallback_to_pillow:
-            result = compress_with_pillow(path)
+            result, path = compress_with_pillow(path)
 
-        new_size = os.path.getsize(path)
+        new_size = path.stat().st_size
         if result and new_size < original_size:
             saved_bytes = original_size - new_size
             total_saved_bytes += saved_bytes
-
-            saved_percent = (1 - new_size / original_size) * 100
-            msg = (
-                f"Сжато: {path} "
-                f"({original_size / 1024:.1f} KB -> {new_size / 1024:.1f} KB, "
-                f"сохранено {saved_percent:.2f}%)"
+            percent = (1 - new_size / original_size) * 100
+            logging.info(
+                f"Сжато: {path} ({original_size / 1024:.1f} KB -> {new_size / 1024:.1f} KB, сохранено {percent:.2f}%)"
             )
-            logging.info(msg)
         else:
-            msg = f"Пропущено (не меньше): {path} ({original_size / 1024:.1f} KB)"
-            logging.info(msg)
+            logging.info(
+                f"Пропущено (не меньше): {path} ({original_size / 1024:.1f} KB)"
+            )
 
+        h = file_hash(path)
         with db_lock:
             cursor.execute(
                 "INSERT INTO processed(hash, filename) VALUES(?, ?)",
-                (h, filename),
+                (h, path.name),
             )
             conn.commit()
-        processed_count += 1
 
+        processed_count += 1
     except Exception as e:
         logging.error(f"Ошибка обработки {path}: {e}")
 
@@ -286,10 +286,11 @@ def main():
 
     print("Проверка утилит...")
     required_tools = ["cjpeg-static.exe", "cwebp.exe"]
-    missing = []
-    for tool in required_tools:
-        if not os.path.exists(get_tool_path(tool)):
-            missing.append(tool)
+    missing = [
+        tool
+        for tool in required_tools
+        if not os.path.exists(get_tool_path(tool))
+    ]
 
     fallback = False
     if missing:
