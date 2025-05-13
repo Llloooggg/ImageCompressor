@@ -252,11 +252,6 @@ def main():
         help="Путь для сканирования. По умолчанию текущая директория.",
         default=None,
     )
-    parser.add_argument(
-        "--dry-run",
-        help="Показать, что будет сделано, без изменения файлов.",
-        action="store_true",
-    )
     args = parser.parse_args()
 
     if args.input:
