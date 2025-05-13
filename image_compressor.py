@@ -311,8 +311,8 @@ def main():
 
     print("\nОбработка завершена.")
     print(f"Всего обработано: {processed_count}")
-    print(f"Пропущено (маленькие/повтор): {skipped_count}")
-    print(f"Сэкономлено в среднем: {total_saved_bytes / 1024 / 1024:.2f} MB")
+    print(f"Пропущено: {skipped_count}")
+    print(f"Сэкономлено: {total_saved_bytes / 1024 / 1024:.2f} MB")
     logging.info(
         f"Завершено. Обработано: {processed_count}, Пропущено: {skipped_count}, Сэкономлено: {total_saved_bytes / 1024 / 1024:.2f} MB"
     )
