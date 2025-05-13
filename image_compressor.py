@@ -12,6 +12,8 @@ from PIL import Image, ImageFile
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+Image.MAX_IMAGE_PIXELS = None
+warnings.simplefilter("ignore", Image.DecompressionBombWarning)
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 warnings.filterwarnings("ignore", category=UserWarning, module="PIL")
 
