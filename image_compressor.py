@@ -285,7 +285,7 @@ def main():
         input_dir = Path(os.getcwd())
 
     print("Проверка утилит...")
-    required_tools = ["cjpeg-static.exe", "cwebp.exe", "oxipng.exe"]
+    required_tools = ["cjpeg-static.exe", "cwebp.exe"]
     missing = []
     for tool in required_tools:
         if not os.path.exists(get_tool_path(tool)):
