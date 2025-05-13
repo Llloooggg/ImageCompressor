@@ -1,0 +1,10 @@
+venv
+
+build
+dist
+*.spec
+
+*~lock*
+file*
+
+*.exe
