@@ -78,7 +78,7 @@ def compress_with_external(path: str, ext: str) -> bool:
     try:
         if ext == ".png":
             tool = get_tool_path("oxipng.exe")
-            for compression_level in range(1, 8):
+            for compression_level in range(1, 6):
                 subprocess.run(
                     [
                         tool,
