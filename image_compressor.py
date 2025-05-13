@@ -29,7 +29,9 @@ MAX_WORKERS = min(32, (multiprocessing.cpu_count() or 1) * 5)
 DB_PATH = "image_compressor.db"
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cursor = conn.cursor()
-cursor.execute("CREATE TABLE IF NOT EXISTS processed (hash TEXT PRIMARY KEY)")
+cursor.execute(
+    "CREATE TABLE IF NOT EXISTS processed (hash TEXT PRIMARY KEY, filename TEXT)"
+)
 conn.commit()
 
 processed_count = 0
@@ -69,6 +71,23 @@ def inject_exif(jpeg_path, exif_bytes):
         logging.error(f"Ошибка при вставке EXIF в {jpeg_path}: {e}")
 
 
+def convert_png_to_jpeg(path: str) -> bool:
+    try:
+        with Image.open(path) as img:
+            temp_path = path.with_suffix(".jpg")
+            img.convert("RGB").save(
+                temp_path, "JPEG", quality=85, optimize=True
+            )
+
+            new_size = temp_path.stat().st_size
+            if new_size < path.stat().st_size:
+                temp_path.replace(path)
+                return True
+    except Exception as e:
+        logging.error(f"Ошибка при конвертации PNG в JPEG для {path}: {e}")
+    return False
+
+
 def compress_with_external(path: str, ext: str) -> bool:
     path = Path(path)
     original_size = path.stat().st_size
@@ -77,25 +96,11 @@ def compress_with_external(path: str, ext: str) -> bool:
 
     try:
         if ext == ".png":
-            tool = get_tool_path("oxipng.exe")
-            for compression_level in range(1, 6):
-                subprocess.run(
-                    [
-                        tool,
-                        "--strip",
-                        "safe",
-                        f"-o{compression_level}",
-                        "--out",
-                        str(tmp_path),
-                        str(path),
-                    ],
-                    check=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-                if os.path.getsize(tmp_path) <= target_size:
-                    break
-        elif ext in [".jpg", ".jpeg"]:
+            if not convert_png_to_jpeg(path):
+                return False
+            ext = ".jpg"
+
+        if ext in [".jpg", ".jpeg"]:
             exif_data = extract_exif(path)
 
             tool = get_tool_path("cjpeg-static.exe")
@@ -207,6 +212,7 @@ def compress_image(path: str, fallback_to_pillow: bool = False):
             return
 
         h = file_hash(path)
+        filename = path.name
         with db_lock:
             cursor.execute("SELECT 1 FROM processed WHERE hash = ?", (h,))
             if cursor.fetchone():
@@ -238,7 +244,10 @@ def compress_image(path: str, fallback_to_pillow: bool = False):
             logging.info(msg)
 
         with db_lock:
-            cursor.execute("INSERT INTO processed(hash) VALUES(?)", (h,))
+            cursor.execute(
+                "INSERT INTO processed(hash, filename) VALUES(?, ?)",
+                (h, filename),
+            )
             conn.commit()
         processed_count += 1
 
