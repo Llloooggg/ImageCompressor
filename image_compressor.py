@@ -31,7 +31,7 @@ DB_PATH = "image_compressor.db"
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cursor = conn.cursor()
 cursor.execute(
-    "CREATE TABLE IF NOT EXISTS processed (hash TEXT PRIMARY KEY, filename TEXT)"
+    "CREATE TABLE IF NOT EXISTS processed_images (hash TEXT PRIMARY KEY, filename TEXT)"
 )
 conn.commit()
 
@@ -95,6 +95,8 @@ def compress_with_external(path: str, ext: str) -> tuple[bool, Path]:
     tmp_path = path.with_name(path.stem + ".compressed" + path.suffix)
     target_size = TARGET_SIZE_MB
 
+    exif_data = extract_exif(path)
+
     try:
         if ext == ".png":
             new_path = convert_png_to_jpeg(path)
@@ -104,7 +106,6 @@ def compress_with_external(path: str, ext: str) -> tuple[bool, Path]:
             ext = ".jpg"
 
         if ext in [".jpg", ".jpeg"]:
-            exif_data = extract_exif(path)
             tool = get_tool_path("cjpeg-static.exe")
             quality = 85
             while True:
@@ -124,8 +125,6 @@ def compress_with_external(path: str, ext: str) -> tuple[bool, Path]:
                 if os.path.getsize(tmp_path) <= target_size or quality < 50:
                     break
                 quality -= 5
-            if tmp_path.exists() and exif_data:
-                inject_exif(tmp_path, exif_data)
 
         elif ext == ".webp":
             tool = get_tool_path("cwebp.exe")
@@ -160,6 +159,8 @@ def compress_with_external(path: str, ext: str) -> tuple[bool, Path]:
         return False, path
 
     if tmp_path.exists():
+        if exif_data:
+            inject_exif(tmp_path, exif_data)
         new_size = tmp_path.stat().st_size
         if new_size < original_size:
             tmp_path.replace(path)
@@ -217,7 +218,9 @@ def compress_image(path: str, fallback_to_pillow: bool = False):
 
         h = file_hash(path)
         with db_lock:
-            cursor.execute("SELECT 1 FROM processed WHERE hash = ?", (h,))
+            cursor.execute(
+                "SELECT 1 FROM processed_images WHERE hash = ?", (h,)
+            )
             if cursor.fetchone():
                 skipped_count += 1
                 logging.info(
@@ -247,7 +250,7 @@ def compress_image(path: str, fallback_to_pillow: bool = False):
         h = file_hash(path)
         with db_lock:
             cursor.execute(
-                "INSERT INTO processed(hash, filename) VALUES(?, ?)",
+                "INSERT INTO processed_images(hash, filename) VALUES(?, ?)",
                 (h, path.name),
             )
             conn.commit()
