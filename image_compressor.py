@@ -37,6 +37,7 @@ processed_count = 0
 skipped_count = 0
 total_saved_bytes = 0
 db_lock = threading.Lock()
+input_dir: Path = None
 
 # --- База данных ---
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -205,10 +206,16 @@ def compress_image(path: Path, use_fallback: bool = False):
     global processed_count, skipped_count, total_saved_bytes
 
     try:
-        if not path.exists() or path.stat().st_size < MIN_SIZE:
+        if not path.exists():
             skipped_count += 1
             logging.info(
-                f"Пропущено (малый размер или не найден): {path} ({path.stat().st_size // 1024}KB)"
+                f"Пропущено (не найден): {path} ({path.stat().st_size // 1024}KB)"
+            )
+            return
+        if not path.exists():
+            skipped_count += 1
+            logging.info(
+                f"Пропущено (малый размер): {path} ({path.stat().st_size // 1024}KB)"
             )
             return
 
@@ -232,10 +239,13 @@ def compress_image(path: Path, use_fallback: bool = False):
             result, final_path = compress_with_pillow(path)
 
         if not final_path.exists():
-            logging.warning(f"Файл не найден после сжатия: {final_path}")
+            logging.warning(
+                f"Файл не найден после сжатия: {final_path} ({original_size // 1024}KB)"
+            )
             return
 
         new_size = final_path.stat().st_size
+        rel_path = final_path.relative_to(input_dir)
 
         if result:
             if new_size < original_size:
@@ -243,7 +253,7 @@ def compress_image(path: Path, use_fallback: bool = False):
                 total_saved_bytes += saved
                 percent = (1 - new_size / original_size) * 100
                 logging.info(
-                    f"Сжато: {path} ({original_size//1024}KB -> {new_size//1024}KB, -{percent:.2f}%)"
+                    f"Сжато: {path} ({original_size//1024}KB -> {new_size//1024}KB, {percent:.2f}%)"
                 )
             else:
                 logging.info(
@@ -254,13 +264,15 @@ def compress_image(path: Path, use_fallback: bool = False):
             with db_lock:
                 cursor.execute(
                     "INSERT INTO processed_images(hash, filename, reduced) VALUES(?, ?, ?)",
-                    (h, final_path.name, new_size < original_size),
+                    (h, str(rel_path), new_size < original_size),
                 )
                 conn.commit()
 
         processed_count += 1
     except Exception as e:
-        logging.error(f"Ошибка при обработке {path}: {e}")
+        logging.error(
+            f"Ошибка при обработке {path} ({original_size // 1024}KB): {e}"
+        )
 
 
 # --- Основной процесс ---
@@ -274,15 +286,15 @@ def find_images(root: Path):
                 yield Path(dirpath) / name
 
 
-def prepare_and_copy_files(input_dir: Path, output_dir: Path) -> list[Path]:
-    if input_dir.resolve() == output_dir.resolve():
-        return list(find_images(input_dir))
+def prepare_and_copy_files(input_dir_: Path, output_dir: Path) -> list[Path]:
+    if input_dir_.resolve() == output_dir.resolve():
+        return list(find_images(input_dir_))
 
     output_dir.mkdir(parents=True, exist_ok=True)
     copied = []
 
-    for image in find_images(input_dir):
-        rel_path = image.relative_to(input_dir)
+    for image in find_images(input_dir_):
+        rel_path = image.relative_to(input_dir_)
         dest = output_dir / rel_path
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(image.read_bytes())
@@ -292,6 +304,8 @@ def prepare_and_copy_files(input_dir: Path, output_dir: Path) -> list[Path]:
 
 
 def main():
+    global input_dir
+
     parser = argparse.ArgumentParser(
         description="Сжатие изображений до заданного размера"
     )
