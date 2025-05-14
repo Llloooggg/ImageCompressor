@@ -35,9 +35,12 @@ logging.basicConfig(
 # --- Глобальные переменные ---
 processed_count = 0
 skipped_count = 0
+skipped_size_count = 0
+error_count = 0
 total_saved_bytes = 0
+total_original_size = 0
+total_new_size = 0
 db_lock = threading.Lock()
-input_dir: Path = None
 
 # --- База данных ---
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -160,6 +163,8 @@ def compress_with_external(
         return None, path
     except Exception as e:
         logging.error(f"Ошибка при сжатии {path} внешней утилитой: {e}")
+        if tmp_path.exists():
+            tmp_path.unlink()
         return False, path
 
     if tmp_path.exists():
@@ -199,27 +204,25 @@ def compress_with_pillow(path: Path) -> Tuple[bool, Path]:
         temp_path.unlink()
     except Exception as e:
         logging.error(f"Pillow не смог сжать {path}: {e}")
+        if temp_path.exists():
+            temp_path.unlink()
     return False, path
 
 
 def compress_image(path: Path, use_fallback: bool = False):
-    global processed_count, skipped_count, total_saved_bytes
+    global processed_count, skipped_count, skipped_size_count, error_count, total_saved_bytes, total_original_size, total_new_size
 
     try:
-        if not path.exists():
-            skipped_count += 1
+        if not path.exists() or path.stat().st_size < MIN_SIZE:
+            skipped_size_count += 1
             logging.info(
-                f"Пропущено (не найден): {path} ({path.stat().st_size // 1024}KB)"
-            )
-            return
-        if not path.exists():
-            skipped_count += 1
-            logging.info(
-                f"Пропущено (малый размер): {path} ({path.stat().st_size // 1024}KB)"
+                f"Пропущено (малый размер или не найден): {path} ({path.stat().st_size // 1024}KB)"
             )
             return
 
         original_size = path.stat().st_size
+        total_original_size += original_size
+
         h = file_hash(path)
         with db_lock:
             cursor.execute(
@@ -239,13 +242,12 @@ def compress_image(path: Path, use_fallback: bool = False):
             result, final_path = compress_with_pillow(path)
 
         if not final_path.exists():
-            logging.warning(
-                f"Файл не найден после сжатия: {final_path} ({original_size // 1024}KB)"
-            )
+            error_count += 1
+            logging.error(f"Файл не найден после сжатия: {final_path}")
             return
 
         new_size = final_path.stat().st_size
-        rel_path = final_path.relative_to(input_dir)
+        total_new_size += new_size
 
         if result:
             if new_size < original_size:
@@ -253,7 +255,7 @@ def compress_image(path: Path, use_fallback: bool = False):
                 total_saved_bytes += saved
                 percent = (1 - new_size / original_size) * 100
                 logging.info(
-                    f"Сжато: {path} ({original_size//1024}KB -> {new_size//1024}KB, {percent:.2f}%)"
+                    f"Сжато: {path} ({original_size//1024}KB -> {new_size//1024}KB, -{percent:.2f}%)"
                 )
             else:
                 logging.info(
@@ -264,15 +266,17 @@ def compress_image(path: Path, use_fallback: bool = False):
             with db_lock:
                 cursor.execute(
                     "INSERT INTO processed_images(hash, filename, reduced) VALUES(?, ?, ?)",
-                    (h, str(rel_path), new_size < original_size),
+                    (h, final_path.name, new_size < original_size),
                 )
                 conn.commit()
 
-        processed_count += 1
+            processed_count += 1
+        else:
+            error_count += 1
+
     except Exception as e:
-        logging.error(
-            f"Ошибка при обработке {path} ({original_size // 1024}KB): {e}"
-        )
+        error_count += 1
+        logging.error(f"Ошибка при обработке {path}: {e}")
 
 
 # --- Основной процесс ---
@@ -286,15 +290,15 @@ def find_images(root: Path):
                 yield Path(dirpath) / name
 
 
-def prepare_and_copy_files(input_dir_: Path, output_dir: Path) -> list[Path]:
-    if input_dir_.resolve() == output_dir.resolve():
-        return list(find_images(input_dir_))
+def prepare_and_copy_files(input_dir: Path, output_dir: Path) -> list[Path]:
+    if input_dir.resolve() == output_dir.resolve():
+        return list(find_images(input_dir))
 
     output_dir.mkdir(parents=True, exist_ok=True)
     copied = []
 
-    for image in find_images(input_dir_):
-        rel_path = image.relative_to(input_dir_)
+    for image in find_images(input_dir):
+        rel_path = image.relative_to(input_dir)
         dest = output_dir / rel_path
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(image.read_bytes())
@@ -304,8 +308,6 @@ def prepare_and_copy_files(input_dir_: Path, output_dir: Path) -> list[Path]:
 
 
 def main():
-    global input_dir
-
     parser = argparse.ArgumentParser(
         description="Сжатие изображений до заданного размера"
     )
@@ -350,11 +352,28 @@ def main():
             print(f"\rОбработка: {i}/{len(files)}", end="")
 
     print("\nГотово.")
-    print(f"Обработано: {processed_count}, Пропущено: {skipped_count}")
-    print(f"Сэкономлено: {total_saved_bytes / 1024 / 1024:.2f} MB")
+    print(f"Обработано успешно: {processed_count}")
+    print(f"Уже обработано: {skipped_count}")
+    print(f"Пропущено из-за размера: {skipped_size_count}")
+    print(f"Ошибки: {error_count}")
+    if total_original_size > 0:
+        total_percent_saved = (1 - total_new_size / total_original_size) * 100
+        print(
+            f"Общий размер до сжатия: {total_original_size / 1024 / 1024:.2f} MB"
+        )
+        print(
+            f"Общий размер после сжатия: {total_new_size / 1024 / 1024:.2f} MB"
+        )
+        print(f"Сэкономлено в процентах: {total_percent_saved:.2f}%")
+
     logging.info(
-        f"Завершено. Обработано: {processed_count}, Пропущено: {skipped_count}, Сэкономлено: {total_saved_bytes / 1024 / 1024:.2f} MB"
+        f"Завершено. Обработано успешно: {processed_count}, Уже обработано: {skipped_count}, Пропущено из-за размера: {skipped_size_count}, Ошибки: {error_count}"
     )
+    if total_original_size > 0:
+        total_percent_saved = (1 - total_new_size / total_original_size) * 100
+        logging.info(
+            f"Общий размер до сжатия: {total_original_size / 1024 / 1024:.2f} MB, Общий размер после сжатия: {total_new_size / 1024 / 1024:.2f} MB, Сэкономлено в процентах: {total_percent_saved:.2f}%"
+        )
 
 
 if __name__ == "__main__":
