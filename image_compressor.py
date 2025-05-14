@@ -28,7 +28,7 @@ warnings.simplefilter("ignore", Image.DecompressionBombWarning)
 logging.basicConfig(
     filename="image_compressor.log",
     level=logging.INFO,
-    format="%(asctime)s - %(message)s",
+    format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
 # Глобальные счётчики
