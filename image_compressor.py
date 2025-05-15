@@ -123,8 +123,6 @@ def compress_with_external(
             converted = convert_png_to_jpeg(path)
             if not converted:
                 return False, path
-            if converted.stat().st_size <= TARGET_SIZE:
-                return True, converted
             path = converted
             ext = ".jpg"
             original_size = path.stat().st_size
@@ -178,15 +176,18 @@ def compress_with_external(
         return False, path
 
     if tmp_path.exists():
-        if tmp_path.stat().st_size < original_size:
+        new_size = tmp_path.stat().st_size
+        if new_size < original_size:
             if exif:
                 inject_exif(tmp_path, exif)
             tmp_path.replace(path)
             return True, path
-        logging.error(
-            f"Не удалось сжать внешней утилитой (не уменьшилось): {path} ({original_size // 1024} KB)"
-        )
-        tmp_path.unlink()
+        else:
+            logging.error(
+                f"Не удалось сжать внешней утилитой (не уменьшилось): {path} ({original_size // 1024} KB)"
+            )
+            tmp_path.unlink()
+
     return False, path
 
 
