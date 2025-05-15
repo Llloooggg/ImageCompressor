@@ -233,7 +233,8 @@ def compress_with_pillow(path: Path) -> Tuple[bool, Path]:
 
 
 def compress_image(path: Path):
-    global processed_count, skipped_count, skipped_size_count, error_count, total_saved_bytes, total_images_original_size, total_images_new_size, processed_hashes
+    global processed_count, skipped_count, skipped_size_count, error_count
+    global total_saved_bytes, total_images_original_size, total_images_new_size, processed_hashes
 
     try:
         original_size = path.stat().st_size
@@ -241,41 +242,41 @@ def compress_image(path: Path):
 
         h = file_hash(path)
 
-        if path.stat().st_size < MAX_SIZE:
+        if original_size < MAX_SIZE:
             logging.info(
-                f"Пропущено (малый размер): {path} ({path.stat().st_size // 1024} KB)"
+                f"Пропущено (малый размер): {path} ({original_size // 1024} KB)"
             )
             processed_hashes.add(h)
             skipped_size_count += 1
             total_images_new_size += original_size
             return
 
+        file_path_str = str(path)
+
         with db_lock:
             cursor.execute(
                 "SELECT filename FROM processed_images WHERE hash = ?", (h,)
             )
             row = cursor.fetchone()
-            file_path = str(path)
             if row:
-                processed_hashes.add(h)
-                skipped_count += 1
-                total_images_new_size += original_size
-
-                hash_files = row[0].split("|")
-                if file_path in hash_files:
+                existing_paths = set(row[0].split("|"))
+                if file_path_str in existing_paths:
                     logging.info(
                         f"Пропущено (уже обработано): {path} ({original_size // 1024} KB)"
                     )
                 else:
-                    hash_files.append(file_path)
+                    existing_paths.add(file_path_str)
                     cursor.execute(
                         "UPDATE processed_images SET filename = ? WHERE hash = ?",
-                        ("|".join(hash_files), h),
+                        ("|".join(sorted(existing_paths)), h),
                     )
                     conn.commit()
                     logging.info(
                         f"Пропущено (дубликат хэша, другой путь): {path} ({original_size // 1024} KB)"
                     )
+                processed_hashes.add(h)
+                skipped_count += 1
+                total_images_new_size += original_size
                 return
 
         ext = path.suffix.lower()
@@ -288,48 +289,47 @@ def compress_image(path: Path):
         total_images_new_size += new_size
 
         if result:
-            h = file_hash(final_path)
-
-            processed_count += 1
-
+            new_hash = file_hash(final_path)
             saved = original_size - new_size
-            total_saved_bytes += saved
             percent = (1 - new_size / original_size) * 100
+
             logging.info(
-                f"Сжато: {path} ({original_size//1024} KB -> {new_size//1024} KB, {percent:.2f}%)"
+                f"Сжато: {path} ({original_size // 1024} KB -> {new_size // 1024} KB, {percent:.2f}%)"
             )
 
             with db_lock:
                 cursor.execute(
                     "SELECT filename FROM processed_images WHERE hash = ?",
-                    (h,),
+                    (new_hash,),
                 )
                 row = cursor.fetchone()
-                file_path = str(final_path)
                 if row:
-                    hash_files = row[0].split("|")
-                    if file_path not in hash_files:
-                        hash_files.append(file_path)
-                        cursor.execute(
-                            "UPDATE processed_images SET filename = ? WHERE hash = ?",
-                            ("|".join(hash_files), h),
-                        )
-                        conn.commit()
+                    paths = set(row[0].split("|"))
+                    paths.add(str(final_path))
+                    cursor.execute(
+                        "UPDATE processed_images SET filename = ? WHERE hash = ?",
+                        ("|".join(sorted(paths)), new_hash),
+                    )
                 else:
                     cursor.execute(
                         "INSERT INTO processed_images(hash, filename) VALUES(?, ?)",
-                        (h, file_path),
+                        (new_hash, str(final_path)),
                     )
-                    conn.commit()
-        else:
-            error_count += 1
+                conn.commit()
 
-        processed_hashes.add(h)
+            processed_hashes.add(new_hash)
+            processed_count += 1
+            total_saved_bytes += saved
+        else:
+            logging.error(f"Не удалось сжать: {path}")
+            processed_hashes.add(h)
+            error_count += 1
+            total_images_new_size += original_size
 
     except Exception as e:
+        logging.error(f"Ошибка при обработке {path}: {e}")
         error_count += 1
         total_images_new_size += original_size
-        logging.error(f"Ошибка при обработке {path}: {e}")
 
 
 def find_images(root: Path):
