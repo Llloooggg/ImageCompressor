@@ -162,8 +162,8 @@ def compress_with_external(
                 inject_exif(tmp_path, exif)
             tmp_path.replace(path)
             return True, path
-        logging.info(
-            f"Пропущено (не уменьшилось): {path} ({original_size // 1024}KB)"
+        logging.error(
+            f"Не удалось сжать (не уменьшилось): {path} ({original_size // 1024}KB)"
         )
         tmp_path.unlink()
     return False, path
@@ -194,8 +194,8 @@ def compress_with_pillow(path: Path) -> Tuple[bool, Path]:
             if temp_path.stat().st_size < original_size:
                 temp_path.replace(path)
                 return True, path
-            logging.info(
-                f"Пропущено (не уменьшилось): {path} ({original_size // 1024}KB)"
+            logging.error(
+                f"Не удалось сжать (не уменьшилось): {path} ({original_size // 1024}KB)"
             )
             temp_path.unlink()
     except Exception as e:
@@ -273,17 +273,12 @@ def compress_image(path: Path, use_fallback: bool = False):
         total_new_size += new_size
 
         if result:
-            if new_size < original_size:
-                saved = original_size - new_size
-                total_saved_bytes += saved
-                percent = (1 - new_size / original_size) * 100
-                logging.info(
-                    f"Сжато: {path} ({original_size//1024}KB -> {new_size//1024}KB, {percent:.2f}%)"
-                )
-            else:
-                logging.info(
-                    f"Пропущено (не уменьшилось): {path} ({original_size // 1024}KB)"
-                )
+            saved = original_size - new_size
+            total_saved_bytes += saved
+            percent = (1 - new_size / original_size) * 100
+            logging.info(
+                f"Сжато: {path} ({original_size//1024}KB -> {new_size//1024}KB, {percent:.2f}%)"
+            )
 
             h = file_hash(final_path)
             with db_lock:
@@ -312,7 +307,7 @@ def compress_image(path: Path, use_fallback: bool = False):
             processed_hashes.add(h)
             processed_count += 1
         else:
-            skipped_count += 1
+            error_count += 1
 
     except Exception as e:
         error_count += 1
