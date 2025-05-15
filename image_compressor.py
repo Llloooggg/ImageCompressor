@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Tuple, Optional
 
 TARGET_SIZE = 2 * 1024 * 1024
-MAX_SIZE = 2 * 1024 * 1024
+MIN_SIZE = 2 * 1024 * 1024
 MAX_WORKERS = min(32, (multiprocessing.cpu_count() or 1) * 5)
 DB_PATH = "image_compressor.db"
 
@@ -54,17 +54,10 @@ def get_tool_path(name: str) -> Path:
 
 
 def get_folder_size(path: Path) -> int:
-    excluded = {
-        "image_compressor.exe",
-        "image_compressor.py",
-        "image_compressor.db",
-        "image_compressor.db-journal",
-        "image_compressor.log",
-    }
     total_size = 0
-    for dirpath, dirnames, filenames in os.walk(path):
+    for dirpath, _, filenames in os.walk(path):
         for filename in filenames:
-            if filename in excluded:
+            if filename.startswith("image_compressor"):
                 continue
             file_path = Path(dirpath) / filename
             total_size += file_path.stat().st_size
@@ -83,27 +76,51 @@ def extract_exif(path: Path):
     try:
         with Image.open(path) as img:
             return img.info.get("exif")
-    except Exception:
+    except Exception as e:
+        logging.warning(
+            f"Не удалось извлечь EXIF из {path} {path.stat().st_size // 1024} KB): {e}"
+        )
         return None
 
 
 def inject_exif(path: Path, exif):
     try:
         with Image.open(path) as img:
-            img.convert("RGB").save(path, "JPEG", exif=exif)
+            fmt = img.format
+            if fmt == "JPEG" and img.mode in ("L", "RGB"):
+                mode = img.mode
+            elif fmt == "WEBP" and img.mode in ("RGBA", "LA"):
+                mode = img.mode
+            else:
+                mode = "RGB"
+            img_converted = img.convert(mode)
+            img_converted.save(path, format=fmt, exif=exif)
     except Exception as e:
-        logging.error(f"Не удалось вставить EXIF в {path}: {e}")
+        logging.warning(
+            f"Не удалось вставить EXIF в {path} {path.stat().st_size // 1024} KB): {e}"
+        )
 
 
 def convert_png_to_jpeg(path: Path) -> Optional[Path]:
-    tmp_path = path.with_suffix(".jpg")
+    base_name = path.stem
+    parent = path.parent
+    suffix = ".jpg"
+
+    new_name = f"{base_name}{suffix}"
+    counter = 1
+    while (parent / new_name).exists():
+        new_name = f"{base_name} ({counter}){suffix}"
+        counter += 1
+
+    tmp_path = parent / new_name
+
     try:
         with Image.open(path) as img:
             img.convert("RGB").save(tmp_path, "JPEG")
             path.unlink()
             return tmp_path
     except Exception as e:
-        logging.error(
+        logging.warning(
             f"Ошибка при конвертации PNG в JPEG: {path} ({path.stat().st_size // 1024} KB): {e}"
         )
         if tmp_path.exists():
@@ -123,9 +140,15 @@ def compress_with_external(
             converted = convert_png_to_jpeg(path)
             if not converted:
                 return False, path
+            conerted_size = converted.stat().st_size
+            logging.warning(
+                f"Сконвертирован PNG в JPEG: {path} ({original_size // 1024} KB) -> {converted} ({conerted_size // 1024} KB)"
+            )
+            if conerted_size < TARGET_SIZE:
+                return True, converted
             path = converted
             ext = ".jpg"
-            original_size = path.stat().st_size
+            original_size = conerted_size
         if ext in [".jpg", ".jpeg"]:
             tool = get_tool_path("cjpeg-static.exe")
             args_base = [
@@ -151,6 +174,9 @@ def compress_with_external(
                 "all",
             ]
         else:
+            logging.warning(
+                f"Неподдерживаемый формат {path} ({original_size // 1024} KB)"
+            )
             return False, path
 
         quality = 85
@@ -168,7 +194,7 @@ def compress_with_external(
             quality -= 5
 
     except Exception as e:
-        logging.error(
+        logging.warning(
             f"Ошибка при сжатии внешней утилитой {path} ({original_size // 1024} KB): {e}"
         )
         if tmp_path.exists():
@@ -176,14 +202,13 @@ def compress_with_external(
         return False, path
 
     if tmp_path.exists():
-        new_size = tmp_path.stat().st_size
-        if new_size < original_size:
+        if tmp_path.stat().st_size < original_size:
             if exif:
                 inject_exif(tmp_path, exif)
             tmp_path.replace(path)
             return True, path
         else:
-            logging.error(
+            logging.warning(
                 f"Не удалось сжать внешней утилитой (не уменьшилось): {path} ({original_size // 1024} KB)"
             )
             tmp_path.unlink()
@@ -213,7 +238,7 @@ def compress_with_pillow(path: Path) -> Tuple[bool, Path]:
                 quality -= 5
 
     except Exception as e:
-        logging.error(
+        logging.warning(
             f"Ошибка при сжатии Pillow {path} ({original_size // 1024} KB): {e}"
         )
         if tmp_path.exists():
@@ -225,7 +250,7 @@ def compress_with_pillow(path: Path) -> Tuple[bool, Path]:
                 inject_exif(tmp_path, exif)
             tmp_path.replace(path)
             return True, path
-        logging.error(
+        logging.warning(
             f"Не удалось сжать Pillow (не уменьшилось): {path} ({original_size // 1024} KB)"
         )
         tmp_path.unlink()
@@ -242,7 +267,7 @@ def compress_image(path: Path):
 
         h = file_hash(path)
 
-        if original_size < MAX_SIZE:
+        if original_size < MIN_SIZE:
             logging.info(
                 f"Пропущено (малый размер): {path} ({original_size // 1024} KB)"
             )
@@ -268,7 +293,7 @@ def compress_image(path: Path):
                     existing_paths.add(file_path_str)
                     cursor.execute(
                         "UPDATE processed_images SET filename = ? WHERE hash = ?",
-                        ("|".join(sorted(existing_paths)), h),
+                        ("|".join(existing_paths), h),
                     )
                     conn.commit()
                     logging.info(
@@ -321,13 +346,17 @@ def compress_image(path: Path):
             processed_count += 1
             total_saved_bytes += saved
         else:
-            logging.error(f"Не удалось сжать: {path}")
+            logging.error(
+                f"Не удалось сжать: {path} ({original_size // 1024} KB)"
+            )
             processed_hashes.add(h)
             error_count += 1
             total_images_new_size += original_size
 
     except Exception as e:
-        logging.error(f"Ошибка при обработке {path}: {e}")
+        logging.error(
+            f"Ошибка при обработке {path} ({original_size // 1024} KB): {e}"
+        )
         error_count += 1
         total_images_new_size += original_size
 
@@ -374,9 +403,6 @@ def main():
 
     print(f"Входная папка: {input_dir}")
     print(f"Выходная папка: {output_dir}")
-    if input("Начать обработку? [y/n]: ").strip().lower() != "y":
-        print("Отменено.")
-        return
 
     print("Проверка необходимых инструментов...")
     required = ["cjpeg-static.exe", "cwebp.exe"]
@@ -392,6 +418,11 @@ def main():
     files = prepare_and_copy_files(input_dir, output_dir)
     total_files = len(files)
     print(f"Найдено {total_files} изображений.")
+    logging.info(f"Найдено {total_files} изображений.")
+
+    if input("Начать обработку? [y/n]: ").strip().lower() != "y":
+        return
+
     logging.info(f"Начато. Найдено {total_files} изображений.")
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
