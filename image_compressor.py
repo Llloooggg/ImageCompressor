@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Tuple, Optional
 
 TARGET_SIZE = 2 * 1024 * 1024
-MIN_SIZE = 2 * 1024 * 1024
+MAX_SIZE = 2 * 1024 * 1024
 MAX_WORKERS = min(32, (multiprocessing.cpu_count() or 1) * 5)
 DB_PATH = "image_compressor.db"
 
@@ -95,19 +95,19 @@ def inject_exif(path: Path, exif):
 
 
 def convert_png_to_jpeg(path: Path) -> Optional[Path]:
-    temp_path = path.with_suffix(".jpg")
+    tmp_path = path.with_suffix(".jpg")
     try:
         with Image.open(path) as img:
-            img.convert("RGB").save(
-                temp_path, "JPEG", quality=85, optimize=True
-            )
-        if temp_path.stat().st_size < path.stat().st_size:
+            img.convert("RGB").save(tmp_path, "JPEG")
             path.unlink()
-            return temp_path
-        temp_path.unlink()
+            return tmp_path
     except Exception as e:
-        logging.error(f"Ошибка при конвертации PNG в JPEG: {path}: {e}")
-    return None
+        logging.error(
+            f"Ошибка при конвертации PNG в JPEG: {path} ({path.stat().st_size // 1024} KB): {e}"
+        )
+        if tmp_path.exists():
+            tmp_path.unlink()
+        return None
 
 
 def compress_with_external(
@@ -122,10 +122,11 @@ def compress_with_external(
             converted = convert_png_to_jpeg(path)
             if not converted:
                 return False, path
+            if converted.stat().st_size <= TARGET_SIZE:
+                return True, converted
             path = converted
             ext = ".jpg"
             original_size = path.stat().st_size
-
         if ext in [".jpg", ".jpeg"]:
             tool = get_tool_path("cjpeg-static.exe")
             args_base = [
@@ -168,7 +169,9 @@ def compress_with_external(
             quality -= 5
 
     except Exception as e:
-        logging.error(f"Ошибка при сжатии {path} внешней утилитой: {e}")
+        logging.error(
+            f"Ошибка при сжатии внешней утилитой {path} ({original_size // 1024} KB): {e}"
+        )
         if tmp_path.exists():
             tmp_path.unlink()
         return False, path
@@ -180,7 +183,48 @@ def compress_with_external(
             tmp_path.replace(path)
             return True, path
         logging.error(
-            f"Не удалось сжать (не уменьшилось): {path} ({original_size // 1024} KB)"
+            f"Не удалось сжать внешней утилитой (не уменьшилось): {path} ({original_size // 1024} KB)"
+        )
+        tmp_path.unlink()
+    return False, path
+
+
+def compress_with_pillow(path: Path) -> Tuple[bool, Path]:
+    original_size = path.stat().st_size
+    tmp_path = path.with_name(path.stem + ".pillowtmp" + path.suffix)
+    exif = extract_exif(path)
+
+    try:
+        with Image.open(path) as img:
+            img_format = img.format
+            quality = 85
+            while quality >= 50:
+                img.save(
+                    tmp_path,
+                    format=img_format,
+                    optimize=True,
+                    quality=quality,
+                    exif=exif,
+                )
+                if tmp_path.stat().st_size <= TARGET_SIZE:
+                    break
+                quality -= 5
+
+    except Exception as e:
+        logging.error(
+            f"Ошибка при сжатии Pillow {path} ({original_size // 1024} KB): {e}"
+        )
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+    if tmp_path.exists():
+        if tmp_path.stat().st_size < original_size:
+            if exif:
+                inject_exif(tmp_path, exif)
+            tmp_path.replace(path)
+            return True, path
+        logging.error(
+            f"Не удалось сжать Pillow (не уменьшилось): {path} ({original_size // 1024} KB)"
         )
         tmp_path.unlink()
     return False, path
@@ -195,7 +239,7 @@ def compress_image(path: Path):
 
         h = file_hash(path)
 
-        if path.stat().st_size < MIN_SIZE:
+        if path.stat().st_size < MAX_SIZE:
             logging.info(
                 f"Пропущено (малый размер): {path} ({path.stat().st_size // 1024} KB)"
             )
@@ -234,6 +278,9 @@ def compress_image(path: Path):
 
         ext = path.suffix.lower()
         result, final_path = compress_with_external(path, ext)
+
+        if not result:
+            result, final_path = compress_with_pillow(path)
 
         new_size = final_path.stat().st_size
         total_images_new_size += new_size
