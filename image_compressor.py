@@ -186,43 +186,7 @@ def compress_with_external(
     return False, path
 
 
-def compress_with_pillow(path: Path) -> Tuple[bool, Path]:
-    original_size = path.stat().st_size
-    temp_path = path.with_name(path.stem + ".pillowtmp" + path.suffix)
-
-    try:
-        with Image.open(path) as img:
-            exif = img.info.get("exif")
-            img_format = img.format
-            quality = 85
-            while quality >= 50:
-                img.save(
-                    temp_path,
-                    format=img_format,
-                    optimize=True,
-                    quality=quality,
-                    exif=exif,
-                )
-                if temp_path.stat().st_size <= TARGET_SIZE:
-                    break
-                quality -= 5
-
-        if temp_path.exists():
-            if temp_path.stat().st_size < original_size:
-                temp_path.replace(path)
-                return True, path
-            logging.error(
-                f"Не удалось сжать (не уменьшилось): {path} ({original_size // 1024} KB)"
-            )
-            temp_path.unlink()
-    except Exception as e:
-        logging.error(f"Ошибка при сжатии {path} Pillow: {e}")
-        if temp_path.exists():
-            temp_path.unlink()
-    return False, path
-
-
-def compress_image(path: Path, use_fallback: bool = False):
+def compress_image(path: Path):
     global processed_count, skipped_count, skipped_size_count, error_count, total_saved_bytes, total_images_original_size, total_images_new_size, processed_hashes
 
     try:
@@ -270,9 +234,6 @@ def compress_image(path: Path, use_fallback: bool = False):
 
         ext = path.suffix.lower()
         result, final_path = compress_with_external(path, ext)
-
-        if not result and use_fallback:
-            result, final_path = compress_with_pillow(path)
 
         new_size = final_path.stat().st_size
         total_images_new_size += new_size
@@ -372,28 +333,20 @@ def main():
     required = ["cjpeg-static.exe", "cwebp.exe"]
     missing = [t for t in required if not get_tool_path(t).exists()]
 
-    use_fallback = False
     if missing:
         print("Не найдены:", ", ".join(missing))
-        choice = input("Использовать Pillow? [y/n]: ").strip().lower()
-        if choice != "y":
-            print("Работа прервана.")
-            return
-        use_fallback = True
+        logging.error("Не найдены:", ", ".join(missing))
+        return
 
     total_original_size = get_folder_size(input_dir)
 
     files = prepare_and_copy_files(input_dir, output_dir)
     total_files = len(files)
     print(f"Найдено {total_files} изображений.")
-    logging.info(
-        f"Начато. Найдено {total_files} изображений. Fallback = {use_fallback}"
-    )
+    logging.info(f"Начато. Найдено {total_files} изображений.")
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [
-            executor.submit(compress_image, f, use_fallback) for f in files
-        ]
+        futures = [executor.submit(compress_image, f) for f in files]
         for i, _ in enumerate(as_completed(futures), 1):
             print(f"\rОбработка: {i}/{len(files)}", end="")
 
