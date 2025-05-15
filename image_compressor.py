@@ -54,19 +54,20 @@ def get_tool_path(name: str) -> Path:
 
 
 def get_folder_size(path: Path) -> int:
+    excluded = {
+        "image_compressor.exe",
+        "image_compressor.py",
+        "image_compressor.db",
+        "image_compressor.db-journal",
+        "image_compressor.log",
+    }
     total_size = 0
     for dirpath, dirnames, filenames in os.walk(path):
         for filename in filenames:
-            file_path = os.path.abspath(os.path.join(dirpath, filename))
-            if file_path in [
-                "image_compressor.exe",
-                "image_compressor.py",
-                "image_compressor.db",
-                "image_compressor.db-journal",
-                "image_compressor.log",
-            ]:
+            if filename in excluded:
                 continue
-            total_size += os.path.getsize(file_path)
+            file_path = Path(dirpath) / filename
+            total_size += file_path.stat().st_size
     return total_size
 
 
