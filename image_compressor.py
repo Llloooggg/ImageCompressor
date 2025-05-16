@@ -310,10 +310,9 @@ def compress_image(path: Path):
         if not result:
             result, final_path = compress_with_pillow(path)
 
-        new_size = final_path.stat().st_size
-        total_images_new_size += new_size
-
         if result:
+            new_size = final_path.stat().st_size
+            total_images_new_size += new_size
             new_hash = file_hash(final_path)
             saved = original_size - new_size
             percent = (1 - new_size / original_size) * 100
