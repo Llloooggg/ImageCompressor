@@ -131,24 +131,24 @@ def convert_png_to_jpeg(path: Path) -> Optional[Path]:
 def compress_with_external(
     path: Path, ext: str
 ) -> Tuple[Optional[bool], Path]:
+    exif = extract_exif(path)
     original_size = path.stat().st_size
     tmp_path = path.with_name(path.stem + ".compressed" + path.suffix)
-    exif = extract_exif(path)
 
     try:
         if ext == ".png":
             converted = convert_png_to_jpeg(path)
             if not converted:
                 return False, path
-            conerted_size = converted.stat().st_size
+            converted_size = converted.stat().st_size
             logging.warning(
-                f"Сконвертирован PNG в JPEG: {path} ({original_size // 1024} KB) -> {converted} ({conerted_size // 1024} KB)"
+                f"Сконвертирован PNG в JPEG: {path} ({original_size // 1024} KB) -> {converted} ({converted_size // 1024} KB)"
             )
-            if conerted_size < TARGET_SIZE:
+            if converted_size <= TARGET_SIZE:
                 return True, converted
             path = converted
             ext = ".jpg"
-            original_size = conerted_size
+            original_size = converted_size
         if ext in [".jpg", ".jpeg"]:
             tool = get_tool_path("cjpeg-static.exe")
             args_base = [
@@ -217,9 +217,9 @@ def compress_with_external(
 
 
 def compress_with_pillow(path: Path) -> Tuple[bool, Path]:
+    exif = extract_exif(path)
     original_size = path.stat().st_size
     tmp_path = path.with_name(path.stem + ".pillowtmp" + path.suffix)
-    exif = extract_exif(path)
 
     try:
         with Image.open(path) as img:
