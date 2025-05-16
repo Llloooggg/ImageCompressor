@@ -78,7 +78,7 @@ def extract_exif(path: Path):
             return img.info.get("exif")
     except Exception as e:
         logging.warning(
-            f"Не удалось извлечь EXIF из {path} {path.stat().st_size // 1024} KB): {e}"
+            f"Не удалось извлечь EXIF из {path.relative_to(input_dir)} {path.stat().st_size // 1024} KB): {e}"
         )
         return None
 
@@ -97,7 +97,7 @@ def inject_exif(path: Path, exif):
             img_converted.save(path, format=fmt, exif=exif)
     except Exception as e:
         logging.warning(
-            f"Не удалось вставить EXIF в {path} {path.stat().st_size // 1024} KB): {e}"
+            f"Не удалось вставить EXIF в {path.relative_to(input_dir)} {path.stat().st_size // 1024} KB): {e}"
         )
 
 
@@ -121,7 +121,7 @@ def convert_png_to_jpeg(path: Path) -> Optional[Path]:
             return tmp_path
     except Exception as e:
         logging.warning(
-            f"Ошибка при конвертации PNG в JPEG: {path} ({path.stat().st_size // 1024} KB): {e}"
+            f"Ошибка при конвертации PNG в JPEG: {path.relative_to(input_dir)} ({path.stat().st_size // 1024} KB): {e}"
         )
         if tmp_path.exists():
             tmp_path.unlink()
@@ -142,7 +142,7 @@ def compress_with_external(
                 return False, path
             converted_size = converted.stat().st_size
             logging.warning(
-                f"Сконвертирован PNG в JPEG: {path} ({original_size // 1024} KB) -> {converted} ({converted_size // 1024} KB)"
+                f"Сконвертирован PNG в JPEG: {path.relative_to(input_dir)} ({original_size // 1024} KB) -> {converted.relative_to(input_dir)} ({converted_size // 1024} KB)"
             )
             if converted_size <= TARGET_SIZE:
                 return True, converted
@@ -175,7 +175,7 @@ def compress_with_external(
             ]
         else:
             logging.warning(
-                f"Неподдерживаемый формат {path} ({original_size // 1024} KB)"
+                f"Неподдерживаемый формат {path.relative_to(input_dir)} ({original_size // 1024} KB)"
             )
             return False, path
 
@@ -195,7 +195,7 @@ def compress_with_external(
 
     except Exception as e:
         logging.warning(
-            f"Ошибка при сжатии внешней утилитой {path} ({original_size // 1024} KB): {e}"
+            f"Ошибка при сжатии внешней утилитой {path.relative_to(input_dir)} ({original_size // 1024} KB): {e}"
         )
         if tmp_path.exists():
             tmp_path.unlink()
@@ -209,7 +209,7 @@ def compress_with_external(
             return True, path
         else:
             logging.warning(
-                f"Не удалось сжать внешней утилитой (не уменьшилось): {path} ({original_size // 1024} KB)"
+                f"Не удалось сжать внешней утилитой (не уменьшилось): {path.relative_to(input_dir)} ({original_size // 1024} KB)"
             )
             tmp_path.unlink()
 
@@ -251,7 +251,7 @@ def compress_with_pillow(path: Path) -> Tuple[bool, Path]:
             tmp_path.replace(path)
             return True, path
         logging.warning(
-            f"Не удалось сжать Pillow (не уменьшилось): {path} ({original_size // 1024} KB)"
+            f"Не удалось сжать Pillow (не уменьшилось): {path.relative_to(input_dir)} ({original_size // 1024} KB)"
         )
         tmp_path.unlink()
     return False, path
@@ -269,14 +269,14 @@ def compress_image(path: Path):
 
         if original_size < MIN_SIZE:
             logging.info(
-                f"Пропущено (малый размер): {path} ({original_size // 1024} KB)"
+                f"Пропущено (малый размер): {path.relative_to(input_dir)} ({original_size // 1024} KB)"
             )
             processed_hashes.add(h)
             skipped_size_count += 1
             total_images_new_size += original_size
             return
 
-        file_path_str = str(path)
+        file_path_str = str(path.relative_to(input_dir))
 
         with db_lock:
             cursor.execute(
@@ -287,17 +287,17 @@ def compress_image(path: Path):
                 existing_paths = set(row[0].split("|"))
                 if file_path_str in existing_paths:
                     logging.info(
-                        f"Пропущено (уже обработано): {path} ({original_size // 1024} KB)"
+                        f"Пропущено (уже обработано): {file_path_str} ({original_size // 1024} KB)"
                     )
                 else:
                     existing_paths.add(file_path_str)
                     cursor.execute(
                         "UPDATE processed_images SET filename = ? WHERE hash = ?",
-                        ("|".join(existing_paths), h),
+                        ("|".join(sorted(existing_paths)), h),
                     )
                     conn.commit()
                     logging.info(
-                        f"Пропущено (дубликат хэша, другой путь): {path} ({original_size // 1024} KB)"
+                        f"Пропущено (дубликат хэша, другой путь): {file_path_str} ({original_size // 1024} KB)"
                     )
                 processed_hashes.add(h)
                 skipped_count += 1
@@ -318,7 +318,7 @@ def compress_image(path: Path):
             percent = (1 - new_size / original_size) * 100
 
             logging.info(
-                f"Сжато: {path} ({original_size // 1024} KB -> {new_size // 1024} KB, {percent:.2f}%)"
+                f"Сжато: {path.relative_to(input_dir)} ({original_size // 1024} KB -> {new_size // 1024} KB, {percent:.2f}%)"
             )
 
             with db_lock:
@@ -329,7 +329,7 @@ def compress_image(path: Path):
                 row = cursor.fetchone()
                 if row:
                     paths = set(row[0].split("|"))
-                    paths.add(str(final_path))
+                    paths.add(str(final_path.relative_to(input_dir)))
                     cursor.execute(
                         "UPDATE processed_images SET filename = ? WHERE hash = ?",
                         ("|".join(sorted(paths)), new_hash),
@@ -337,7 +337,7 @@ def compress_image(path: Path):
                 else:
                     cursor.execute(
                         "INSERT INTO processed_images(hash, filename) VALUES(?, ?)",
-                        (new_hash, str(final_path)),
+                        (new_hash, str(final_path.relative_to(input_dir))),
                     )
                 conn.commit()
 
@@ -346,7 +346,7 @@ def compress_image(path: Path):
             total_saved_bytes += saved
         else:
             logging.error(
-                f"Не удалось сжать: {path} ({original_size // 1024} KB)"
+                f"Не удалось сжать: {path.relative_to(input_dir)} ({original_size // 1024} KB)"
             )
             processed_hashes.add(h)
             error_count += 1
@@ -354,7 +354,7 @@ def compress_image(path: Path):
 
     except Exception as e:
         logging.error(
-            f"Ошибка при обработке {path} ({original_size // 1024} KB): {e}"
+            f"Ошибка при обработке {path.relative_to(input_dir)} ({original_size // 1024} KB): {e}"
         )
         error_count += 1
         total_images_new_size += original_size
@@ -386,6 +386,8 @@ def prepare_and_copy_files(input_dir: Path, output_dir: Path) -> list[Path]:
 
 
 def main():
+    global input_dir
+
     parser = argparse.ArgumentParser(
         description="Сжатие изображений до заданного размера"
     )
@@ -431,6 +433,7 @@ def main():
 
     total_new_size = get_folder_size(input_dir)
 
+    print("\n\nОчистка БД...")
     with db_lock:
         cursor.execute("SELECT hash, filename FROM processed_images")
         all_records = cursor.fetchall()
@@ -442,15 +445,15 @@ def main():
             db_file_list = [
                 f.strip() for f in filenames.split("|") if f.strip()
             ]
-            real_file_list = [
-                f
-                for f in db_file_list
-                if Path(f).exists() and file_hash(Path(f)) == h
-            ]
+            real_files_list = []
+            for file in db_file_list:
+                full_path = input_dir / file
+                if full_path.exists() and file_hash(full_path) == h:
+                    real_files_list.append(file)
             reasone = None
             if h in stale_hashes:
                 reasone = "не встречался хэш"
-            if not real_file_list:
+            if not real_files_list:
                 reasone = "файлы не сущестувуют"
             if reasone:
                 cursor.execute(
@@ -463,11 +466,11 @@ def main():
             else:
                 cursor.execute(
                     "UPDATE processed_images SET filename = ? WHERE hash = ?",
-                    ("|".join(sorted(set(real_file_list))), h),
+                    ("|".join(set(real_files_list)), h),
                 )
         conn.commit()
 
-        print(f"\n\nУдалено записей в БД: {deleted_count}")
+        print(f"Удалено записей в БД: {deleted_count}")
         logging.info(f"Удалено записей в БД: {deleted_count}")
 
     print("\nГотово.")
