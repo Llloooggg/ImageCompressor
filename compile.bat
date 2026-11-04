@@ -1,1 +1,0 @@
-pyinstaller --onefile --console --icon=image_compressor.ico  --add-binary "tools/*.exe:tools" ./image_compressor.py

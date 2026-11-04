@@ -1,10 +1,29 @@
-venv
-
-build
-dist
-*.spec
-
-*~lock*
-file*
-
+# Go build output
+/dist/
+/bin/
+/build/
 *.exe
+*.dll
+*.so
+*.dylib
+
+# generated Windows resource (recreate with `go generate`)
+*.syso
+
+# tool runtime artifacts (these live in the user's archive, never in the repo)
+image_compressor.db
+image_compressor.db-wal
+image_compressor.db-shm
+image_compressor.log
+*.log
+
+# test scratch
+/testdata/tmp/
+*.tmp
+
+# editors / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*~lock*
