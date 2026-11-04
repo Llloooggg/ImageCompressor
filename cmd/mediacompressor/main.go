@@ -16,6 +16,7 @@ import (
 
 	"github.com/Llloooggg/ImageCompressor/internal/assets"
 	"github.com/Llloooggg/ImageCompressor/internal/config"
+	"github.com/Llloooggg/ImageCompressor/internal/media"
 	"github.com/Llloooggg/ImageCompressor/internal/runner"
 	"github.com/Llloooggg/ImageCompressor/internal/store"
 	"github.com/Llloooggg/ImageCompressor/internal/tools"
@@ -61,8 +62,13 @@ func runMain(ctx context.Context, cfg *config.Config) error {
 		fmt.Printf("Режим: на месте (исходники не удаляем до успеха)\n")
 	}
 	fmt.Printf("БД:    %s\n", cfg.Database)
-	fmt.Printf("Фото:  AVIF (q=%d%s)   Видео: MP4+AV1 (crf=%d, %s)\n",
-		cfg.PhotoQ, losslessTag(cfg.PhotoLoss), cfg.VideoCRF, cfg.VideoEnc)
+	ladder := media.CRFLadder(cfg.VideoCRF)
+	guardTag := ""
+	if cfg.VideoVMAF > 0 {
+		guardTag = fmt.Sprintf(", vmaf>=%.0f", cfg.VideoVMAF)
+	}
+	fmt.Printf("Фото:  AVIF (q=%d%s)   Видео: MP4+AV1 (crf %d→%d авто-лестница%s, %s)\n",
+		cfg.PhotoQ, losslessTag(cfg.PhotoLoss), ladder[0], ladder[len(ladder)-1], guardTag, cfg.VideoEnc)
 
 	if !cfg.DryRun && !cfg.Yes {
 		if !confirm(ctx) {

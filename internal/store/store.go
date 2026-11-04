@@ -50,6 +50,7 @@ type Record struct {
 	Migrated int
 	Outcome  string // compressed | nochange | "" (legacy unknown)
 	Stamp    string // settings fingerprint for nochange decisions
+	Achieved string // actual result quality ("crf=34 vmaf=96.4", "q=85"); "" = unknown
 }
 
 // StagedRow is an in-flight swap that a crash may have interrupted.
@@ -130,6 +131,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		"updated_at":   "TEXT",
 		"outcome":      "TEXT",
 		"stamp":        "TEXT",
+		"achieved":     "TEXT", // actual result quality: "crf=34 vmaf=96.4" / "q=85" (feeds future re-compression)
 	}
 	for col, typ := range want {
 		if !have[col] {
@@ -220,9 +222,9 @@ func (s *Store) IsProcessed(ctx context.Context, hash string) (Record, bool, err
 	err := s.db.QueryRowContext(ctx, `
 		SELECT hash, IFNULL(filename,''), IFNULL(media_kind,''), IFNULL(format,''),
 		       IFNULL(tool,''), IFNULL(tool_version,''), IFNULL(migrated,0),
-		       IFNULL(outcome,''), IFNULL(stamp,'')
+		       IFNULL(outcome,''), IFNULL(stamp,''), IFNULL(achieved,'')
 		FROM processed_images WHERE hash = ? LIMIT 1`, hash).Scan(
-		&r.Hash, &r.Filename, &r.Media, &r.Format, &r.Tool, &r.Version, &r.Migrated, &r.Outcome, &r.Stamp)
+		&r.Hash, &r.Filename, &r.Media, &r.Format, &r.Tool, &r.Version, &r.Migrated, &r.Outcome, &r.Stamp, &r.Achieved)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Record{}, false, nil
 	}
@@ -235,10 +237,11 @@ func (s *Store) IsProcessed(ctx context.Context, hash string) (Record, bool, err
 // shouldMergePaths: markProcessed/MarkNoChange upsert and merge the "|" filename list.
 
 // MarkCompressed records a hash we produced (canonical output on disk).
-func (s *Store) MarkCompressed(ctx context.Context, hash, relPath, media, format, tool, version string) error {
+// achieved carries the actual result quality ("crf=34 vmaf=96.4", "q=85").
+func (s *Store) MarkCompressed(ctx context.Context, hash, relPath, media, format, tool, version, achieved string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.upsert(ctx, s.db, hash, relPath, media, format, tool, version, OutcomeCompressed, "")
+	return s.upsert(ctx, s.db, hash, relPath, media, format, tool, version, OutcomeCompressed, "", achieved)
 }
 
 // MarkNoChange records that a source hash was evaluated but could not be shrunk
@@ -246,7 +249,7 @@ func (s *Store) MarkCompressed(ctx context.Context, hash, relPath, media, format
 func (s *Store) MarkNoChange(ctx context.Context, hash, relPath, media, format, tool, version, stamp string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.upsert(ctx, s.db, hash, relPath, media, format, tool, version, OutcomeNoChange, stamp)
+	return s.upsert(ctx, s.db, hash, relPath, media, format, tool, version, OutcomeNoChange, stamp, "")
 }
 
 // MarkMigrated flips migrated=1 for a hash (used by --migrate, runs once).
@@ -272,7 +275,7 @@ func (s *Store) BeginSwap(ctx context.Context, sourceHash, expectedHash, finalPa
 
 // CommitSwap finalizes the swap: records the new hash as processed and removes
 // the staged row in one transaction.
-func (s *Store) CommitSwap(ctx context.Context, stagedID int64, newHash, relPath, media, format, tool, version string) error {
+func (s *Store) CommitSwap(ctx context.Context, stagedID int64, newHash, relPath, media, format, tool, version, achieved string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -280,7 +283,7 @@ func (s *Store) CommitSwap(ctx context.Context, stagedID int64, newHash, relPath
 		return err
 	}
 	defer tx.Rollback()
-	if err := s.upsert(ctx, tx, newHash, relPath, media, format, tool, version, OutcomeCompressed, ""); err != nil {
+	if err := s.upsert(ctx, tx, newHash, relPath, media, format, tool, version, OutcomeCompressed, "", achieved); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, "DELETE FROM staged WHERE id = ?", stagedID); err != nil {
@@ -291,7 +294,7 @@ func (s *Store) CommitSwap(ctx context.Context, stagedID int64, newHash, relPath
 
 // upsert inserts/updates a processed row, merging the "|" filename list. It
 // works both on the DB and inside a transaction (both satisfy execer).
-func (s *Store) upsert(ctx context.Context, ex execer, hash, relPath, media, format, tool, version, outcome, stamp string) error {
+func (s *Store) upsert(ctx context.Context, ex execer, hash, relPath, media, format, tool, version, outcome, stamp, achieved string) error {
 	var existing sql.NullString
 	err := ex.QueryRowContext(ctx, "SELECT filename FROM processed_images WHERE hash = ?", hash).Scan(&existing)
 	merged := relPath
@@ -308,8 +311,8 @@ func (s *Store) upsert(ctx context.Context, ex execer, hash, relPath, media, for
 		return err
 	}
 	_, err = ex.ExecContext(ctx, `
-		INSERT INTO processed_images(hash, filename, media_kind, format, tool, tool_version, outcome, stamp, updated_at)
-		VALUES(?,?,?,?,?,?,?,?,?)
+		INSERT INTO processed_images(hash, filename, media_kind, format, tool, tool_version, outcome, stamp, achieved, updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(hash) DO UPDATE SET
 			filename=excluded.filename,
 			media_kind=COALESCE(NULLIF(excluded.media_kind,''), processed_images.media_kind),
@@ -318,8 +321,9 @@ func (s *Store) upsert(ctx context.Context, ex execer, hash, relPath, media, for
 			tool_version=excluded.tool_version,
 			outcome=excluded.outcome,
 			stamp=excluded.stamp,
+			achieved=COALESCE(NULLIF(excluded.achieved,''), processed_images.achieved),
 			updated_at=excluded.updated_at`,
-		hash, merged, media, format, tool, version, outcome, stamp, time.Now().UTC().Format(time.RFC3339))
+		hash, merged, media, format, tool, version, outcome, stamp, achieved, time.Now().UTC().Format(time.RFC3339))
 	return err
 }
 

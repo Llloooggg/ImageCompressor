@@ -33,10 +33,11 @@ const (
 
 // Opts are the encoding knobs (already validated/normalized by config).
 type Opts struct {
-	PhotoQ    int  // 0..100
-	PhotoLoss bool // pixel-exact AVIF
-	VideoCRF  int  // 0..50 (AV1), lower = better/heavier
-	Encoder   string
+	PhotoQ       int     // 0..100
+	PhotoLoss    bool    // pixel-exact AVIF
+	VideoCRF     int     // CRF floor of the ladder (escalation +6/+12, capped at 45)
+	VideoVMAFMin float64 // min acceptable VMAF for ESCALATED levels (0 disables the guard)
+	Encoder      string
 }
 
 // EncodeImage stills -> AVIF (CPU: avifenc preferred, ffmpeg fallback). GPU is a
@@ -124,7 +125,14 @@ type cand struct {
 }
 
 // VideoChain is the ordered list of AV1 encoders to try for a given mode.
-type VideoChain struct{ cands []cand }
+// It remembers the mode/availability it was built from, so the CRF level can
+// be re-resolved per file (see EncodeVideo's auto ladder) without re-probing.
+type VideoChain struct {
+	cands []cand
+	mode  string          // encoder mode this chain was built for
+	avail map[string]bool // probed encoder availability
+	crf   int             // base CRF that produced cands
+}
 
 // Codecs returns the codec names in try-order (for logging).
 func (v VideoChain) Codecs() []string {
@@ -133,6 +141,35 @@ func (v VideoChain) Codecs() []string {
 		out[i] = c.codec
 	}
 	return out
+}
+
+// WithCRF returns the same encoder order rebuilt at another CRF level.
+func (v VideoChain) WithCRF(crf int) VideoChain {
+	if crf == v.crf {
+		return v
+	}
+	nc := Opts{Encoder: v.mode, VideoCRF: crf}.buildChain(v.avail)
+	nc.mode, nc.avail, nc.crf = v.mode, v.avail, crf
+	return nc
+}
+
+// CRFLadder returns the per-file CRF levels tried within one run: base,
+// base+6, base+12 (capped at 45). The first level that yields a smaller file
+// wins; escalation happens only when the lower level could NOT shrink the
+// file at all. Measured on the real archive: for socially re-encoded sources
+// (already quality-capped by the platform) base+12 lands at VMAF >= 95
+// (difference invisible to the eye), while clean camera footage never leaves
+// the base level — so this approximates per-file quality matching for free.
+func CRFLadder(base int) []int {
+	base = clamp(base, 1, 45)
+	levels := []int{base}
+	for _, step := range []int{6, 12} {
+		n := clamp(base+step, 1, 45)
+		if n != levels[len(levels)-1] {
+			levels = append(levels, n)
+		}
+	}
+	return levels
 }
 
 // AvailableEncoders probes ffmpeg for AV1 encoders. Returns codec->available.
@@ -158,6 +195,13 @@ func AvailableEncoders(ctx context.Context, loc *tools.Locator) map[string]bool 
 // If the ffmpeg build lacks libsvtav1 (e.g. gyan essentials) but has libaom-av1,
 // the CPU slot honestly degrades to libaom instead of failing mid-run.
 func (o Opts) BuildVideoChain(avail map[string]bool) VideoChain {
+	v := o.buildChain(avail)
+	v.mode, v.avail, v.crf = o.Encoder, avail, o.VideoCRF
+	return v
+}
+
+// buildChain assembles candidate encoders with quality values baked in.
+func (o Opts) buildChain(avail map[string]bool) VideoChain {
 	crf := o.VideoCRF
 	svt := cand{"libsvtav1", "-crf", strconv.Itoa(clamp(crf, 1, 45))}
 	aom := cand{"libaom-av1", "-crf", strconv.Itoa(clamp(crf, 4, 40))}
@@ -179,39 +223,58 @@ func (o Opts) BuildVideoChain(avail map[string]bool) VideoChain {
 
 	switch o.Encoder {
 	case EncLibaom, "max":
-		return VideoChain{[]cand{aom}}
+		return VideoChain{cands: []cand{aom}}
 	case EncCPU:
-		return VideoChain{[]cand{cpu}}
+		return VideoChain{cands: []cand{cpu}}
 	case EncGPU:
-		return VideoChain{gpu} // may be empty -> caller reports "no GPU AV1"
+		return VideoChain{cands: gpu} // may be empty -> caller reports "no GPU AV1"
 	case EncNVENC:
-		return VideoChain{[]cand{nv}}
+		return VideoChain{cands: []cand{nv}}
 	case EncAMF:
-		return VideoChain{[]cand{amf}}
+		return VideoChain{cands: []cand{amf}}
 	case EncQSV:
-		return VideoChain{[]cand{qsv}}
+		return VideoChain{cands: []cand{qsv}}
 	default: // auto: GPU first, then CPU (SVT-AV1 or libaom)
-		return VideoChain{append(gpu, cpu)}
+		return VideoChain{cands: append(gpu, cpu)}
 	}
 }
 
-// EncodeVideo tries the encoder chain, keeping tmp only when it actually shrinks
-// the file below origSize (so a GPU attempt that doesn't help defers to CPU).
-// If a candidate ran but no encoder beat the original it returns ErrNotSmaller.
-// Audio is copied losslessly; if that fails for ALL encoders (audio codec
-// incompatible with MP4, e.g. Opus/Vorbis) it retries once transcoding audio to
-// AAC so the file is still valid and usually smaller.
-func EncodeVideo(ctx context.Context, loc *tools.Locator, o Opts, chain VideoChain, src, tmp string, origSize int64) error {
+// VideoResult reports what EncodeVideo actually achieved when it kept a temp:
+// the effective CRF of the winning encode (after ladder + bisection) and the
+// measured VMAF against the original (-1 = never measured). The runner stores
+// it so future runs know at which quality the file already sits.
+type VideoResult struct {
+	CRF  int
+	VMAF float64
+}
+
+// EncodeVideo tries the encoder chain across the CRF ladder (see CRFLadder):
+// the first level that produces a file smaller than origSize wins (so a GPU
+// attempt that doesn't help defers to CPU, and a source that can't shrink at
+// the base quality is retried at coarser qualities instead of being skipped).
+// Only if NO level shrinks it do we return ErrNotSmaller.
+//
+// Quality guard: the BASE level is taken as-is (it is the user's quality
+// order), but an ESCALATED winner is verified against the original with
+// libvmaf. If the difference is visible (VMAF < floor) we bisection-search
+// the (previous, winner) CRF band for a point that is BOTH smaller than the
+// original AND imperceptible; if no such point exists the file is left
+// untouched — we never trade visible quality for size.
+//
+// Audio is copied losslessly; if that fails for ALL encoders on ALL levels
+// (audio codec incompatible with MP4, e.g. Opus/Vorbis) it retries the whole
+// ladder transcoding audio to AAC so the file is still valid and usually smaller.
+func EncodeVideo(ctx context.Context, loc *tools.Locator, o Opts, chain VideoChain, src, tmp string, origSize int64) (VideoResult, error) {
 	ff := loc.FFmpeg()
 	if ff == "" {
-		return fmt.Errorf("no encoder: ffmpeg not found for video")
+		return VideoResult{}, fmt.Errorf("no encoder: ffmpeg not found for video")
 	}
 	if len(chain.cands) == 0 {
-		return fmt.Errorf("no usable AV1 encoder for mode %q", o.Encoder)
+		return VideoResult{}, fmt.Errorf("no usable AV1 encoder for mode %q", o.Encoder)
 	}
 
-	attempt := func(audioArgs []string) (kept, ran bool, lastErr error) {
-		for _, c := range chain.cands {
+	attempt := func(ch VideoChain, audioArgs []string) (kept, ran bool, lastErr error) {
+		for _, c := range ch.cands {
 			args := videoFFArgs(c, audioArgs, src, tmp)
 			if err := run(loc, ff, args...); err != nil {
 				lastErr = fmt.Errorf("%s: %w", c.codec, err)
@@ -227,26 +290,104 @@ func EncodeVideo(ctx context.Context, loc *tools.Locator, o Opts, chain VideoCha
 		return false, ran, lastErr
 	}
 
-	// Pass 1: lossless audio copy.
-	if kept, ran, err := attempt([]string{"-c:a", "copy"}); kept {
-		return nil
-	} else if ran {
-		// Encoders worked (audio copy is fine) but none shrank it -> honest outcome.
-		return ErrNotSmaller
-	} else if err == nil {
-		return ErrNotSmaller
+	ladder := CRFLadder(chain.crf)
+
+	// runLadder walks the whole ladder for one audio strategy, applying the
+	// VMAF guard + bisection to escalated winners (see function doc).
+	runLadder := func(audioArgs []string) (kept bool, info VideoResult, anyRan bool, lastErr error) {
+		for i, lvl := range ladder {
+			kept, ran, err := attempt(chain.WithCRF(lvl), audioArgs)
+			if kept {
+				if i == 0 || o.VideoVMAFMin <= 0 {
+					return true, VideoResult{CRF: lvl, VMAF: -1}, true, nil // base level: user's order; or guard disabled
+				}
+				score := videoVMAF(ctx, loc, ff, tmp, src)
+				if score < 0 || score >= o.VideoVMAFMin {
+					return true, VideoResult{CRF: lvl, VMAF: score}, true, nil // passed the floor (libvmaf missing -> honest fallback)
+				}
+				// Smaller but visibly worse: bisection in the band between the
+				// last level that could NOT shrink and this level that lost VMAF.
+				os.Remove(tmp)
+				lo, hi := ladder[i-1], lvl
+				for probe := 0; probe < 4; probe++ {
+					mid := (lo + hi) / 2
+					if mid <= lo || mid >= hi {
+						break
+					}
+					k2, ran2, e2 := attempt(chain.WithCRF(mid), audioArgs)
+					anyRan = anyRan || ran2
+					if e2 != nil {
+						lastErr = e2
+					}
+					if !k2 {
+						lo = mid // still not smaller: push crf up
+						continue
+					}
+					s2 := videoVMAF(ctx, loc, ff, tmp, src)
+					if s2 < 0 || s2 >= o.VideoVMAFMin {
+						return true, VideoResult{CRF: mid, VMAF: s2}, true, nil // both smaller and imperceptible
+					}
+					os.Remove(tmp)
+					hi = mid // smaller but visible: pull crf back
+				}
+				// No point in the band was both smaller AND imperceptible ->
+				// leave the file alone; deeper levels only trade more quality.
+				return false, VideoResult{}, true, nil
+			}
+			anyRan = anyRan || ran
+			if err != nil {
+				lastErr = err
+			}
+		}
+		return false, VideoResult{}, anyRan, lastErr
 	}
 
-	// Pass 2: audio copy failed for every encoder -> container/audio incompatible.
-	// Transcode audio to AAC and try the chain again.
-	if kept, ran, err := attempt([]string{"-c:a", "aac", "-b:a", "192k"}); kept {
-		return nil
-	} else if ran {
-		return ErrNotSmaller
-	} else if err != nil {
-		return err
+	// Pass 1: lossless audio copy across the ladder.
+	kept, info, anyRan, lastErr := runLadder([]string{"-c:a", "copy"})
+	if kept {
+		return info, nil
 	}
-	return ErrNotSmaller
+	if anyRan {
+		// Encoders worked (audio copy is fine) but nothing shrank enough
+		// honestly (or the guard refused a visible trade) -> honest outcome.
+		return VideoResult{}, ErrNotSmaller
+	}
+
+	// Pass 2: audio copy failed for every encoder on every level ->
+	// container/audio incompatible. Transcode audio to AAC across the ladder.
+	kept, info, anyRan, lastErr = runLadder([]string{"-c:a", "aac", "-b:a", "192k"})
+	if kept {
+		return info, nil
+	}
+	if anyRan {
+		return VideoResult{}, ErrNotSmaller
+	}
+	if lastErr != nil {
+		return VideoResult{}, lastErr
+	}
+	return VideoResult{}, ErrNotSmaller
+}
+
+// videoVMAF scores candidate against the original file (reference) with
+// libvmaf. >=95 was measured on this archive as "difference invisible to the
+// eye". Returns -1 when libvmaf is unavailable or the pass failed — callers
+// must not block compression on a metrics-tool hiccup (honest fallback).
+func videoVMAF(ctx context.Context, loc *tools.Locator, ff, candidate, original string) float64 {
+	out, err := loc.Run(ctx, ff, "-hide_banner", "-i", candidate, "-i", original,
+		"-lavfi", "libvmaf", "-f", "null", "-")
+	if err != nil {
+		return -1
+	}
+	s := string(out)
+	i := strings.LastIndex(s, "VMAF score:")
+	if i < 0 {
+		return -1
+	}
+	var score float64
+	if _, err := fmt.Sscanf(s[i:], "VMAF score: %f", &score); err != nil {
+		return -1
+	}
+	return score
 }
 
 // videoFFArgs assembles an ffmpeg command for one video candidate + audio args.

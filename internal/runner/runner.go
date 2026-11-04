@@ -14,7 +14,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/Llloooggg/ImageCompressor/internal/config"
 	"github.com/Llloooggg/ImageCompressor/internal/detect"
@@ -41,11 +43,12 @@ type Runner struct {
 	processRoot string
 	hasAvifenc  bool
 	hasFFmpeg   bool
+	changes     *changeLog
 
-	processed, skipDone, skipNotSmaller, skipUnknown, errored atomic.Int64
-	origBytes, newBytes                                        atomic.Int64
-	done                                                       atomic.Int64
-	total                                                      int
+	processed, skipDone, skipNotSmaller, skipUnknown, fixedExt, errored atomic.Int64
+	origBytes, newBytes, scanBytes                                atomic.Int64
+	done                                                          atomic.Int64
+	total                                                         int
 }
 
 func New(cfg *config.Config, st *store.Store, loc *tools.Locator) *Runner {
@@ -53,7 +56,7 @@ func New(cfg *config.Config, st *store.Store, loc *tools.Locator) *Runner {
 		cfg:        cfg,
 		store:      st,
 		loc:        loc,
-		opts:       media.Opts{PhotoQ: cfg.PhotoQ, PhotoLoss: cfg.PhotoLoss, VideoCRF: cfg.VideoCRF, Encoder: cfg.VideoEnc},
+		opts:       media.Opts{PhotoQ: cfg.PhotoQ, PhotoLoss: cfg.PhotoLoss, VideoCRF: cfg.VideoCRF, VideoVMAFMin: cfg.VideoVMAF, Encoder: cfg.VideoEnc},
 		exif:       loc.Exiftool(),
 		hasAvifenc: loc.Avifenc() != "",
 		hasFFmpeg:  loc.FFmpeg() != "",
@@ -66,7 +69,7 @@ func New(cfg *config.Config, st *store.Store, loc *tools.Locator) *Runner {
 func (r *Runner) stampFor(k detect.Kind) string {
 	switch k {
 	case detect.KindVideo:
-		return fmt.Sprintf("vid|%d|%s|ff=%v", r.opts.VideoCRF, r.opts.Encoder, r.hasFFmpeg)
+		return fmt.Sprintf("vid|%d|%.0f|%s|ff=%v", r.opts.VideoCRF, r.opts.VideoVMAFMin, r.opts.Encoder, r.hasFFmpeg)
 	case detect.KindAnimated:
 		return fmt.Sprintf("anim|%d|%v|avifenc=%v|ff=%v", r.opts.PhotoQ, r.opts.PhotoLoss, r.hasAvifenc, r.hasFFmpeg)
 	default:
@@ -114,6 +117,9 @@ func (r *Runner) Recover(ctx context.Context) error {
 
 // CleanTemps removes leftover temp files under the process root.
 func (r *Runner) CleanTemps() error {
+	if _, err := os.Stat(r.processRoot); err != nil {
+		return nil // fresh --output dir doesn't exist yet — nothing to clean
+	}
 	_, err := safefs.CleanupTemps(r.processRoot)
 	return err
 }
@@ -129,7 +135,20 @@ func (r *Runner) Run(ctx context.Context) error {
 		return fmt.Errorf("recover: %w", err)
 	}
 	if err := r.CleanTemps(); err != nil {
-		log.Printf("cleanup temps: %v", err)
+		r.logf("cleanup temps: %v", err)
+	}
+
+	if !r.cfg.DryRun {
+		// Audit trail next to the DB: what became what, sizes, quality achieved.
+		p := changeLogPath(r.cfg.Database)
+		cl, err := openChangeLog(p)
+		if err != nil {
+			log.Printf("changelog %s: %v", p, err)
+		} else {
+			r.changes = cl
+			defer cl.close()
+			fmt.Printf("Журнал: %s\n", p)
+		}
 	}
 
 	if r.cfg.Migrate {
@@ -152,6 +171,30 @@ func (r *Runner) Run(ctx context.Context) error {
 	r.total = len(files)
 	fmt.Printf("Найдено файлов: %d\n", r.total)
 
+	// Live single-line status (progress, savings, rate, ETA) in a real console;
+	// when output is redirected/piped, print a compact line every 1000 files so
+	// logs stay readable.
+	start := time.Now()
+	tty := isTerminal(os.Stdout)
+	statusStop := make(chan struct{})
+	var statusWg sync.WaitGroup
+	if tty {
+		statusWg.Add(1)
+		go func() {
+			defer statusWg.Done()
+			tick := time.NewTicker(500 * time.Millisecond)
+			defer tick.Stop()
+			for {
+				select {
+				case <-tick.C:
+					r.printStatus(start)
+				case <-statusStop:
+					return
+				}
+			}
+		}()
+	}
+
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(r.cfg.Workers)
 	for _, f := range files {
@@ -159,20 +202,80 @@ func (r *Runner) Run(ctx context.Context) error {
 		g.Go(func() error {
 			r.process(gctx, f)
 			n := r.done.Add(1)
-			fmt.Printf("\rОбработка: %d/%d", n, r.total)
+			if tty {
+				r.printStatus(start)
+			} else if n%1000 == 0 {
+				fmt.Printf("Обработка: %d/%d\n", n, r.total)
+			}
 			return nil
 		})
 	}
-	if err := g.Wait(); err != nil {
+	err = g.Wait()
+	close(statusStop)
+	statusWg.Wait()
+	if tty {
+		fmt.Print("\r" + strings.Repeat(" ", 110) + "\r")
+	}
+	if err != nil {
 		return err
 	}
 	fmt.Println()
 	return nil
 }
 
+// printStatus renders the single-line live status (TTY mode). Labels are kept
+// terse/ASCII so the line stays readable regardless of the console codepage.
+func (r *Runner) printStatus(start time.Time) {
+	done := r.done.Load()
+	pct := 0.0
+	if r.total > 0 {
+		pct = 100 * float64(done) / float64(r.total)
+	}
+	el := time.Since(start)
+	savedMB := float64(r.origBytes.Load()-r.newBytes.Load()) / (1024 * 1024)
+	rate := 0.0
+	if el.Seconds() > 0 {
+		rate = savedMB / el.Seconds()
+	}
+	// ETA from scanned bytes already accounted for (file-count ETA is skewed
+	// by instant skip-hits; bytes track real work much better).
+	eta := "--:--:--"
+	doneB, scanB := r.origBytes.Load(), r.scanBytes.Load()
+	if doneB > 0 && scanB > doneB {
+		eta = fmtDur(time.Duration(float64(el) * float64(scanB-doneB) / float64(doneB)))
+	}
+	line := fmt.Sprintf("[%s] %d/%d (%.0f%%)  ok:%d done:%d nofit:%d ext:%d err:%d  |  saved %.0f MB (%.1f MB/s)  |  ETA %s",
+		fmtDur(el), done, r.total, pct,
+		r.processed.Load(), r.skipDone.Load(), r.skipNotSmaller.Load(),
+		r.fixedExt.Load(), r.errored.Load(),
+		savedMB, rate, eta)
+	fmt.Print("\r" + fmt.Sprintf("%-110s", line))
+}
+
+func fmtDur(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	return fmt.Sprintf("%02d:%02d:%02d", int(d.Hours()), int(d.Minutes())%60, int(d.Seconds())%60)
+}
+
+func isTerminal(f *os.File) bool {
+	fi, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
+}
+
 // gather lists files to process (copying to --output first when needed).
 func (r *Runner) gather(ctx context.Context) ([]string, error) {
 	src := r.cfg.Input
+	// Guard: the output dir may live inside the input dir — never walk into it
+	// (previous runs' mirrors would resurrect as inputs).
+	outDir := ""
+	if !r.cfg.InPlace() && isUnder(r.cfg.Output, src) {
+		outDir = r.cfg.Output
+	}
 	var out []string
 	err := filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -181,11 +284,20 @@ func (r *Runner) gather(ctx context.Context) ([]string, error) {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if outDir != "" && (p == outDir || strings.HasPrefix(p, outDir+string(filepath.Separator))) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
 		if d.IsDir() {
 			return nil
 		}
 		if safefs.IsTempName(p) || isOurArtifact(p, r.cfg.Database) {
 			return nil
+		}
+		if fi, ierr := d.Info(); ierr == nil {
+			r.scanBytes.Add(fi.Size()) // feeds the byte-based ETA in the live status
 		}
 		out = append(out, p)
 		return nil
@@ -197,52 +309,90 @@ func (r *Runner) gather(ctx context.Context) ([]string, error) {
 	if r.cfg.InPlace() {
 		return out, nil
 	}
-	// copy media to output, then process the copies (original untouched)
+
+	// Output mode: the output dir must be a FULL mirror of the input — every
+	// file lands there (non-media copied as-is, media copied then processed
+	// in place inside the mirror; originals never touched).
 	var dest []string
 	for _, p := range out {
-		res, err := detect.Detect(p)
-		if err != nil || res.Kind == detect.KindUnknown {
-			continue
-		}
 		rel, err := filepath.Rel(src, p)
 		if err != nil {
 			continue
 		}
 		dpath := filepath.Join(r.cfg.Output, rel)
-		// Incremental output mode: if the honest final output already exists
-		// (complete — swaps are atomic renames), this input is already done:
-		// re-copying would resurrect raw originals and force a full re-encode.
-		if final := r.finalPath(dpath, res); fileExists(final) {
-			r.skipDone.Add(1)
-			r.addSize(p, final)
+
+		// Incremental: the honest final output already exists (swaps are
+		// atomic renames) — re-copying would resurrect raw originals.
+		if res, derr := detect.Detect(p); derr == nil && res.Kind != detect.KindUnknown {
+			if final := r.finalPath(dpath, res); fileExists(final) {
+				r.skipDone.Add(1)
+				r.addSize(p, final)
+				continue
+			}
+			// A previous run mirrored this file but fixed a lying extension:
+			// reuse the honest copy instead of re-copying the raw liar.
+			if honest := res.Format.HonestExt(); honest != "" {
+				if hp := replaceExt(dpath, honest); hp != dpath && fileExists(hp) && sameSize(p, hp) {
+					dest = append(dest, hp)
+					continue
+				}
+			}
+		}
+		// Already mirrored (same size) by a previous run — reuse it instead of
+		// re-copying bytes every run (media swaps always change the size).
+		if sameSize(p, dpath) {
+			dest = append(dest, dpath)
 			continue
 		}
 		if err := os.MkdirAll(filepath.Dir(dpath), 0o755); err != nil {
 			return nil, err
 		}
 		if err := safefs.CopyFileBytes(p, dpath); err != nil {
-			log.Printf("copy %s: %v", p, err)
+			r.logf("copy %s: %v", p, err)
 			continue
 		}
 		// Output mode: fs times must mirror the originals (rule: preserve
 		// timestamps). CopyFileBytes moves bytes only; without this the swaps
 		// below would propagate the fresh (copy-time) stamps instead.
 		if err := meta.CopyFileTimes(p, dpath); err != nil {
-			logf(r.cfg, "copy times %s: %v", rel, err)
+			r.logf("copy times %s: %v", rel, err)
 		}
 		if err := meta.CopyBirthTime(p, dpath); err != nil {
-			logf(r.cfg, "copy birthtime %s: %v", rel, err)
+			r.logf("copy birthtime %s: %v", rel, err)
 		}
 		dest = append(dest, dpath)
 	}
 	return dest, nil
 }
 
+// isUnder reports whether child is parent itself or lives inside it.
+func isUnder(child, parent string) bool {
+	rel, err := filepath.Rel(parent, child)
+	if err != nil {
+		return false
+	}
+	return rel == "." || rel == string(filepath.Separator) ||
+		(rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
+}
+
+// sameSize compares file sizes; false if either is missing/unreadable.
+func sameSize(a, b string) bool {
+	ai, err := os.Stat(a)
+	if err != nil {
+		return false
+	}
+	bi, err := os.Stat(b)
+	if err != nil {
+		return false
+	}
+	return ai.Size() == bi.Size()
+}
+
 func (r *Runner) process(ctx context.Context, path string) {
 	res, err := detect.Detect(path)
 	if err != nil {
 		r.errored.Add(1)
-		logf(r.cfg, "detect %s: %v", path, err)
+		r.logf("detect %s: %v", path, err)
 		return
 	}
 	if res.Kind == detect.KindUnknown {
@@ -258,7 +408,7 @@ func (r *Runner) process(ctx context.Context, path string) {
 	h, err := hashFile(path)
 	if err != nil {
 		r.errored.Add(1)
-		logf(r.cfg, "hash %s: %v", path, err)
+		r.logf("hash %s: %v", path, err)
 		return
 	}
 
@@ -266,7 +416,7 @@ func (r *Runner) process(ctx context.Context, path string) {
 	rec, processed, err := r.store.IsProcessed(ctx, h)
 	if err != nil {
 		r.errored.Add(1)
-		logf(r.cfg, "db lookup %s: %v", path, err)
+		r.logf("db lookup %s: %v", path, err)
 		return
 	}
 	if processed {
@@ -276,12 +426,14 @@ func (r *Runner) process(ctx context.Context, path string) {
 			if rec.Stamp == r.stampFor(res.Kind) {
 				r.skipDone.Add(1)
 				r.addSize(path, path)
+				r.ensureHonestExt(path, res) // lying ext is fixed even for untouched files
 				return
 			}
 		default: // compressed / legacy output already on disk
 			if !r.legacyNeedsMigrate(h) {
 				r.skipDone.Add(1)
 				r.addSize(path, path)
+				r.ensureHonestExt(path, res)
 				return
 			}
 		}
@@ -317,11 +469,12 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 	tmp, err := safefs.TempName(finalPath)
 	if err != nil {
 		r.errored.Add(1)
-		logf(r.cfg, "temp %s: %v", path, err)
+		r.logf("temp %s: %v", path, err)
 		return
 	}
 
 	var encErr error
+	var vinfo media.VideoResult
 	var origSize int64
 	if oi, err := os.Stat(path); err == nil {
 		origSize = oi.Size()
@@ -332,30 +485,33 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 	case detect.KindAnimated:
 		encErr = media.EncodeAnimated(ctx, r.loc, r.opts, path, tmp)
 	case detect.KindVideo:
-		encErr = media.EncodeVideo(ctx, r.loc, r.opts, r.vchain, path, tmp, origSize)
+		vinfo, encErr = media.EncodeVideo(ctx, r.loc, r.opts, r.vchain, path, tmp, origSize)
 	default:
 		encErr = errors.New("unsupported media kind")
 	}
+	achieved := r.achievedFor(res.Kind, vinfo)
 	if errors.Is(encErr, media.ErrNotSmaller) {
 		safefs.RemoveIfExists(tmp)
 		r.skipNotSmaller.Add(1)
 		r.addSize(path, path)
 		_ = r.store.MarkNoChange(ctx, srcHash, rel, res.Kind.String(), mediaFormatFor(res, finalPath), toolSelf, toolVersion, r.stampFor(res.Kind))
+		r.changes.record("не уменьшился", rel, rel, origSize, origSize, res.Kind.String(), mediaFormatFor(res, finalPath), "", "")
+		r.ensureHonestExt(path, res)
 		return
 	}
 	if encErr != nil {
 		safefs.RemoveIfExists(tmp)
 		r.errored.Add(1)
-		logf(r.cfg, "encode %s: %v", rel, encErr)
+		r.logf("encode %s: %v", rel, encErr)
 		return
 	}
 
 	// Transfer metadata into the temp (so the final file carries the originals).
 	if err := meta.TransferTags(ctx, r.exif, path, tmp); err != nil {
 		if !errors.Is(err, meta.ErrNoExiftool) {
-			logf(r.cfg, "meta %s: %v", rel, err)
+			r.logf("meta %s: %v", rel, err)
 		} else {
-			logf(r.cfg, "meta: exiftool не найден — метаданные могут потеряться: %s", rel)
+			r.logf("meta: exiftool не найден — метаданные могут потеряться: %s", rel)
 		}
 	}
 	// Restore original filesystem times before the swap.
@@ -364,14 +520,14 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 	if err := safefs.SyncFile(tmp); err != nil {
 		safefs.RemoveIfExists(tmp)
 		r.errored.Add(1)
-		logf(r.cfg, "fsync %s: %v", rel, err)
+		r.logf("fsync %s: %v", rel, err)
 		return
 	}
 	newHash, err := hashFile(tmp)
 	if err != nil {
 		safefs.RemoveIfExists(tmp)
 		r.errored.Add(1)
-		logf(r.cfg, "hash tmp %s: %v", rel, err)
+		r.logf("hash tmp %s: %v", rel, err)
 		return
 	}
 
@@ -383,6 +539,8 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 		r.skipNotSmaller.Add(1)
 		r.addSize(path, path)
 		_ = r.store.MarkNoChange(ctx, srcHash, rel, res.Kind.String(), mediaFormatFor(res, finalPath), toolSelf, toolVersion, r.stampFor(res.Kind))
+		r.changes.record("не уменьшился", rel, rel, origInfo.Size(), newInfo.Size(), res.Kind.String(), mediaFormatFor(res, finalPath), "", "")
+		r.ensureHonestExt(path, res)
 		return
 	}
 
@@ -391,20 +549,20 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 	if err != nil {
 		safefs.RemoveIfExists(tmp)
 		r.errored.Add(1)
-		logf(r.cfg, "begin swap %s: %v", rel, err)
+		r.logf("begin swap %s: %v", rel, err)
 		return
 	}
 	if err := safefs.AtomicReplace(tmp, finalPath); err != nil {
 		_ = r.store.DropStaged(ctx, sid)
 		safefs.RemoveIfExists(tmp)
 		r.errored.Add(1)
-		logf(r.cfg, "rename %s: %v", rel, err)
+		r.logf("rename %s: %v", rel, err)
 		return
 	}
 	newRel := r.rel(finalPath)
-	if err := r.store.CommitSwap(ctx, sid, newHash, newRel, res.Kind.String(), mediaFormatFor(res, finalPath), toolSelf, toolVersion); err != nil {
+	if err := r.store.CommitSwap(ctx, sid, newHash, newRel, res.Kind.String(), mediaFormatFor(res, finalPath), toolSelf, toolVersion, achieved); err != nil {
 		r.errored.Add(1)
-		logf(r.cfg, "commit %s: %v", rel, err)
+		r.logf("commit %s: %v", rel, err)
 		return
 	}
 	if r.cfg.Migrate && r.legacyNeedsMigrate(srcHash) {
@@ -414,7 +572,7 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 	// Restore NTFS creation time onto the swapped-in file (Windows; no-op elsewhere).
 	// Uses the pre-swap capture so same-name swaps (mp4->mp4) stay honest too.
 	if err := meta.SetBirthTime(finalPath, srcBirth); err != nil {
-		logf(r.cfg, "birthtime %s: %v", newRel, err)
+		r.logf("birthtime %s: %v", newRel, err)
 	}
 
 	// If we converted a file to a new extension, drop the old one (rename already
@@ -427,9 +585,57 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 	} else {
 		r.addSize(path, finalPath)
 	}
+	dstSize := int64(0)
+	if newInfo != nil {
+		dstSize = newInfo.Size()
+	}
+	srcSize := origSize
+	if origInfo != nil {
+		srcSize = origInfo.Size()
+	}
+	r.changes.record("сжат", rel, newRel, srcSize, dstSize, res.Kind.String(), mediaFormatFor(res, finalPath), achieved, "")
 	if finalPath != path {
 		safefs.RemoveIfExists(path)
 	}
+}
+
+// ensureHonestExt renames a media file whose extension lies, EVEN when the
+// file is not compressed (user rule: lying extensions are always fixed —
+// viewers must never be handed a file whose bytes contradict its name).
+// On a name collision the file is left untouched with a warning. DB
+// decisions are hash-based, so no stored-filename rewrite is required.
+// Call AFTER addSize (a rename would make the old path unstatable).
+func (r *Runner) ensureHonestExt(path string, res detect.Result) {
+	if !res.ExtensionLies {
+		return
+	}
+	honest := res.Format.HonestExt()
+	if honest == "" {
+		return
+	}
+	newPath := replaceExt(path, honest)
+	if newPath == path {
+		return
+	}
+	if r.cfg.DryRun {
+		fmt.Printf("[dry-run] fix-ext: %s -> %s\n", r.rel(path), r.rel(newPath))
+		return
+	}
+	if fileExists(newPath) {
+		r.logf("fix-ext %s: цель %s уже существует — имя не меняем", r.rel(path), r.rel(newPath))
+		return
+	}
+	var sz int64
+	if fi, err := os.Stat(path); err == nil {
+		sz = fi.Size()
+	}
+	if err := os.Rename(path, newPath); err != nil {
+		r.errored.Add(1)
+		r.logf("fix-ext %s: %v", r.rel(path), err)
+		return
+	}
+	r.fixedExt.Add(1)
+	r.changes.record("исправлено расширение", r.rel(path), r.rel(newPath), sz, sz, res.Kind.String(), honest, "", "")
 }
 
 func (r *Runner) fixExtOnly(path string, res detect.Result) {
@@ -447,12 +653,12 @@ func (r *Runner) fixExtOnly(path string, res detect.Result) {
 	}
 	if err := os.Rename(path, newPath); err != nil {
 		r.errored.Add(1)
-		logf(r.cfg, "fix-ext %s: %v", r.rel(path), err)
+		r.logf("fix-ext %s: %v", r.rel(path), err)
 		return
 	}
 	// update stored filename mapping for the known hash
 	if h, err := hashFile(newPath); err == nil {
-		_ = r.store.MarkCompressed(context.Background(), h, r.rel(newPath), res.Kind.String(), string(res.Format), "fix-ext", toolVersion)
+		_ = r.store.MarkCompressed(context.Background(), h, r.rel(newPath), res.Kind.String(), string(res.Format), "fix-ext", toolVersion, "")
 	}
 	r.processed.Add(1)
 	r.addSize(path, newPath)
@@ -463,7 +669,7 @@ func (r *Runner) finalize(ctx context.Context, sid int64, finalPath, expectedHas
 	if err != nil {
 		return r.store.DropStaged(ctx, sid)
 	}
-	return r.store.CommitSwap(ctx, sid, expectedHash, r.rel(finalPath), res.Kind.String(), mediaFormatFor(res, finalPath), toolSelf, toolVersion)
+	return r.store.CommitSwap(ctx, sid, expectedHash, r.rel(finalPath), res.Kind.String(), mediaFormatFor(res, finalPath), toolSelf, toolVersion, "")
 }
 
 func (r *Runner) rel(p string) string {
@@ -503,9 +709,9 @@ func (r *Runner) Summary() string {
 		pct = (1 - nb/ob) * 100
 	}
 	return fmt.Sprintf(
-		"Готово. Сжато/заменено: %d, уже обработано: %d, не уменьшилось: %d, не-медиа: %d, ошибок: %d\n"+
+		"Готово. Сжато/заменено: %d, уже обработано: %d, не уменьшилось: %d, исправлено расширений: %d, не-медиа: %d, ошибок: %d\n"+
 			"Размер: %.2f MB -> %.2f MB (%.2f%%)",
-		r.processed.Load(), r.skipDone.Load(), r.skipNotSmaller.Load(), r.skipUnknown.Load(), r.errored.Load(),
+		r.processed.Load(), r.skipDone.Load(), r.skipNotSmaller.Load(), r.fixedExt.Load(), r.skipUnknown.Load(), r.errored.Load(),
 		ob, nb, pct,
 	)
 }
@@ -534,10 +740,14 @@ func replaceExt(path, ext string) string {
 	return base + ext
 }
 
-// isOurArtifact skips the tool's own database (and WAL/SHM sidecars).
+// isOurArtifact skips the tool's own database (and WAL/SHM sidecars) and the
+// change-log sidecar that lives next to it.
 func isOurArtifact(p, dbPath string) bool {
 	base := filepath.Base(p)
 	if base == "image_compressor.db" || base == "image_compressor.db-wal" || base == "image_compressor.db-shm" {
+		return true
+	}
+	if p == changeLogPath(dbPath) {
 		return true
 	}
 	if strings.HasSuffix(base, ".db") || strings.HasSuffix(base, ".db-wal") || strings.HasSuffix(base, ".db-shm") {
@@ -576,4 +786,42 @@ func logf(cfg *config.Config, format string, v ...any) {
 		// keep a visible but compact line for real errors
 		fmt.Fprintf(os.Stderr, "! "+format+"\n", v...)
 	}
+}
+
+// r.logf logs an anomaly (console/log) AND mirrors it into the change log so
+// a double-click run keeps its full error trail on disk.
+func (r *Runner) logf(format string, v ...any) {
+	logf(r.cfg, format, v...)
+	r.changes.record("ошибка", "", "", 0, 0, "", "", "", fmt.Sprintf(format, v...))
+}
+
+// achievedFor renders the actual result quality stored in the DB ("achieved"
+// column) — for future runs it answers "at what quality does this file already
+// sit, is there room to squeeze further?".
+func (r *Runner) achievedFor(k detect.Kind, v media.VideoResult) string {
+	switch k {
+	case detect.KindVideo:
+		if v.CRF == 0 {
+			return ""
+		}
+		if v.VMAF >= 0 {
+			return fmt.Sprintf("crf=%d vmaf=%.1f", v.CRF, v.VMAF)
+		}
+		return fmt.Sprintf("crf=%d", v.CRF)
+	case detect.KindImage, detect.KindAnimated:
+		if r.opts.PhotoLoss {
+			return "lossless"
+		}
+		return fmt.Sprintf("q=%d", r.opts.PhotoQ)
+	default:
+		return ""
+	}
+}
+
+// changeLogPath puts the audit TSV next to the DB, sharing its base name:
+// <dir>/image_compressor.db -> <dir>/image_compressor.changes.tsv.
+func changeLogPath(dbPath string) string {
+	dir := filepath.Dir(dbPath)
+	base := strings.TrimSuffix(filepath.Base(dbPath), ".db")
+	return filepath.Join(dir, base+".changes.tsv")
 }

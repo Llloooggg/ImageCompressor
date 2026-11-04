@@ -21,7 +21,7 @@ func TestProcessedAndStaged(t *testing.T) {
 	if _, ok, _ := s.IsProcessed(ctx, "h1"); ok {
 		t.Fatal("h1 should be unknown initially")
 	}
-	if err := s.MarkCompressed(ctx, "h1", "a.jpg", "image", "avif", "self", "1"); err != nil {
+	if err := s.MarkCompressed(ctx, "h1", "a.jpg", "image", "avif", "self", "1", "q=85"); err != nil {
 		t.Fatal(err)
 	}
 	rec, ok, _ := s.IsProcessed(ctx, "h1")
@@ -30,6 +30,9 @@ func TestProcessedAndStaged(t *testing.T) {
 	}
 	if rec.Outcome != OutcomeCompressed {
 		t.Fatalf("outcome want compressed, got %q", rec.Outcome)
+	}
+	if rec.Achieved != "q=85" {
+		t.Fatalf("achieved want q=85, got %q", rec.Achieved)
 	}
 
 	// staged flow: begin -> pending -> commit
@@ -44,7 +47,7 @@ func TestProcessedAndStaged(t *testing.T) {
 	if len(rows) != 1 || rows[0].ID != id {
 		t.Fatalf("want 1 pending staged, got %d", len(rows))
 	}
-	if err := s.CommitSwap(ctx, id, "newH", "final.avif", "image", "avif", "self", "1"); err != nil {
+	if err := s.CommitSwap(ctx, id, "newH", "final.avif", "image", "avif", "self", "1", ""); err != nil {
 		t.Fatal(err)
 	}
 	rows, _ = s.PendingStaged(ctx)

@@ -40,3 +40,52 @@ func TestBuildVideoChain(t *testing.T) {
 		})
 	}
 }
+
+func TestCRFLadder(t *testing.T) {
+	tests := []struct {
+		base int
+		want []int
+	}{
+		{24, []int{24, 30, 36}},
+		{28, []int{28, 34, 40}},
+		{36, []int{36, 42, 45}}, // capped at 45, no duplicates
+		{40, []int{40, 45}},
+		{45, []int{45}},
+		{2, []int{2, 8, 14}},
+	}
+	for _, tt := range tests {
+		if got := CRFLadder(tt.base); !reflect.DeepEqual(got, tt.want) {
+			t.Errorf("CRFLadder(%d) = %v, want %v", tt.base, got, tt.want)
+		}
+	}
+}
+
+func TestWithCRFRebuild(t *testing.T) {
+	avail := map[string]bool{"av1_nvenc": true, "libsvtav1": true}
+	ch := Opts{VideoCRF: 28, Encoder: EncAuto}.BuildVideoChain(avail)
+	up := ch.WithCRF(34)
+
+	// Same encoder order, every quality value rebuilt at the new level.
+	if !reflect.DeepEqual(ch.Codecs(), up.Codecs()) {
+		t.Fatalf("order changed: %v -> %v", ch.Codecs(), up.Codecs())
+	}
+	for _, c := range up.cands {
+		if c.value != "34" && c.codec != "av1_nvenc" {
+			t.Errorf("%s value = %q, want rebuilt at 34", c.codec, c.value)
+		}
+	}
+	if up.cands[0].codec == "av1_nvenc" && up.cands[0].value != "34" {
+		t.Errorf("nvenc cq = %q, want 34", up.cands[0].value)
+	}
+	// Base chain must not be mutated; rebuild at the same level is a no-op.
+	if ch.crf != 28 || ch.cands[0].value != "28" {
+		t.Fatalf("base chain mutated: crf=%d value=%q", ch.crf, ch.cands[0].value)
+	}
+	if same := up.WithCRF(34); same.crf != 34 {
+		t.Errorf("WithCRF(34) on 34-chain changed: %d", same.crf)
+	}
+	// Mode/availability survive the rebuild (no re-probe).
+	if up.mode != EncAuto || !up.avail["libsvtav1"] {
+		t.Errorf("mode/avail lost: mode=%q avail=%v", up.mode, up.avail)
+	}
+}
