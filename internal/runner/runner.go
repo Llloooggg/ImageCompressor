@@ -209,6 +209,14 @@ func (r *Runner) gather(ctx context.Context) ([]string, error) {
 			continue
 		}
 		dpath := filepath.Join(r.cfg.Output, rel)
+		// Incremental output mode: if the honest final output already exists
+		// (complete — swaps are atomic renames), this input is already done:
+		// re-copying would resurrect raw originals and force a full re-encode.
+		if final := r.finalPath(dpath, res); existsFile(final) {
+			r.skipDone.Add(1)
+			r.addSize(p, final)
+			continue
+		}
 		if err := os.MkdirAll(filepath.Dir(dpath), 0o755); err != nil {
 			return nil, err
 		}
@@ -219,6 +227,11 @@ func (r *Runner) gather(ctx context.Context) ([]string, error) {
 		dest = append(dest, dpath)
 	}
 	return dest, nil
+}
+
+func existsFile(p string) bool {
+	st, err := os.Stat(p)
+	return err == nil && !st.IsDir()
 }
 
 func (r *Runner) process(ctx context.Context, path string) {
@@ -397,12 +410,17 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 
 	// If we converted a file to a new extension, drop the old one (rename already
 	// replaced same-name; a different honest name needs the old removed).
+	// Sizes must be tallied BEFORE removing the source (its stat would fail after).
+	r.processed.Add(1)
+	if origInfo != nil && newInfo != nil {
+		r.origBytes.Add(origInfo.Size())
+		r.newBytes.Add(newInfo.Size())
+	} else {
+		r.addSize(path, finalPath)
+	}
 	if finalPath != path {
 		safefs.RemoveIfExists(path)
 	}
-
-	r.processed.Add(1)
-	r.addSize(path, finalPath)
 }
 
 func (r *Runner) fixExtOnly(path string, res detect.Result) {

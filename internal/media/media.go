@@ -40,20 +40,26 @@ type Opts struct {
 }
 
 // EncodeImage stills -> AVIF (CPU: avifenc preferred, ffmpeg fallback). GPU is a
-// video concept; still-image AVIF stays CPU regardless of --gpu.
+// video concept; still-image AVIF stays CPU regardless of --gpu. avifenc only
+// decodes JPEG/PNG, so on any avifenc failure (e.g. WebP/HEIC input) we fall
+// back to ffmpeg, which decodes everything.
 func EncodeImage(ctx context.Context, loc *tools.Locator, o Opts, src, tmp string) error {
-	avifenc := loc.Avifenc()
-	if avifenc == "" {
-		return encodeImageFFmpeg(ctx, loc, o, src, tmp)
+	if a := loc.Avifenc(); a != "" {
+		args := []string{"--speed", "6"}
+		if o.PhotoLoss {
+			args = append(args, "--lossless")
+		} else {
+			args = append(args, "-q", strconv.Itoa(clamp(o.PhotoQ, 0, 100)))
+		}
+		args = append(args, src, tmp)
+		if err := run(loc, a, args...); err == nil {
+			if st, serr := os.Stat(tmp); serr == nil && st.Size() > 0 {
+				return nil
+			}
+		}
+		os.Remove(tmp) // partial output from the failed attempt
 	}
-	args := []string{"--speed", "6"}
-	if o.PhotoLoss {
-		args = append(args, "--lossless")
-	} else {
-		args = append(args, "-q", strconv.Itoa(clamp(o.PhotoQ, 0, 100)))
-	}
-	args = append(args, src, tmp)
-	return run(loc, avifenc, args...)
+	return encodeImageFFmpeg(ctx, loc, o, src, tmp)
 }
 
 // encodeImageFFmpeg is the fallback: decodes any image via ffmpeg and muxes AVIF.
