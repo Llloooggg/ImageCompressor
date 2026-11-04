@@ -11,12 +11,12 @@
   "StringFileInfo": {
     "Comments": "Пакетное сжатие семейного фото/видео архива (AVIF/AV1)",
     "CompanyName": "",
-    "FileDescription": "MediaCompressor",
+    "FileDescription": "ImageCompressor",
     "FileVersion": "0.1.0",
-    "InternalName": "mediacompressor",
+    "InternalName": "image_compressor",
     "LegalCopyright": "",
-    "OriginalFilename": "mediacompressor.exe",
-    "ProductName": "MediaCompressor",
+    "OriginalFilename": "image_compressor.exe",
+    "ProductName": "ImageCompressor",
     "ProductVersion": "0.1.0"
   },
   "VarFileInfo": {

@@ -329,8 +329,7 @@ func TestGather_OutputMode_HonestCopyReused(t *testing.T) {
 	}
 }
 
-// When the output dir lives inside the input dir, its contents must never be
-// walked as inputs (previous mirror resurrecting as fresh source).
+// Output inside input: previous mirror must never be walked back as input.
 func TestGather_OutputInsideInput_Excluded(t *testing.T) {
 	ctx := context.Background()
 	in := t.TempDir()
@@ -358,5 +357,65 @@ func TestGather_OutputInsideInput_Excluded(t *testing.T) {
 	}
 	if len(paths) != 1 || paths[0] != filepath.Join(out, "a.txt") {
 		t.Fatalf("output subtree leaked into inputs: %v", paths)
+	}
+}
+
+func TestReplaceExtChain(t *testing.T) {
+	tests := []struct {
+		path, ext, want string
+	}{
+		{"a.mp4.mov", ".mp4", "a.mp4"},          // chained exts collapse into one
+		{"b.jpg.jpg", ".avif", "b.avif"},        // doubled ext fully replaced
+		{"liar.dat", ".jpg", "liar.jpg"},        // unknown ext dropped as before
+		{"photo.final.jpg", ".avif", "photo.final.avif"}, // dots inside names stay
+		{"bandicam 2021-07-21 22-08-04-365.mp4", ".mp4", "bandicam 2021-07-21 22-08-04-365.mp4"},
+		{"plain", ".mp4", "plain.mp4"},
+		{"VID_20260227_102325_800.mp4.mov", ".mp4", "VID_20260227_102325_800.mp4"},
+	}
+	for _, tt := range tests {
+		if got := replaceExt(tt.path, tt.ext); got != tt.want {
+			t.Errorf("replaceExt(%q, %q) = %q, want %q", tt.path, tt.ext, got, tt.want)
+		}
+	}
+}
+
+// Doubled media extension (".mp4.mp4" noise from earlier tools) must be
+// cleaned to a single honest ext even when the file itself is not compressed.
+func TestEnsureHonestExt_DoubledExt_Cleaned(t *testing.T) {
+	r, _ := newTestRunner(t)
+
+	// minimal ftyp box so detect classifies it as MP4 (KindVideo)
+	mk := make([]byte, 24)
+	binary.BigEndian.PutUint32(mk[0:4], 24)
+	copy(mk[4:8], "ftyp")
+	copy(mk[8:12], "isom")
+	copy(mk[16:20], "isom")
+	copy(mk[20:24], "mp41")
+
+	path := filepath.Join(r.processRoot, "VID_2026.mp4.mp4")
+	if err := os.WriteFile(path, mk, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, err := detect.Detect(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Format != detect.FmtMP4 {
+		t.Fatalf("want mp4, got %v", res.Format)
+	}
+	if res.ExtensionLies {
+		t.Fatal("ext not expected to lie here — the doubled chain alone must trigger the fix")
+	}
+
+	r.ensureHonestExt(path, res)
+
+	if _, err := os.Stat(filepath.Join(r.processRoot, "VID_2026.mp4")); err != nil {
+		t.Fatalf("clean name missing: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatal("doubled name must be gone")
+	}
+	if r.fixedExt.Load() != 1 {
+		t.Fatalf("fixedExt = %d, want 1", r.fixedExt.Load())
 	}
 }

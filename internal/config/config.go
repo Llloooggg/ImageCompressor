@@ -55,7 +55,7 @@ func DefaultWorkers() int {
 
 // Parse builds a Config from CLI args. Default input = executable's directory.
 func Parse(args []string) (*Config, error) {
-	fs := flag.NewFlagSet("mediacompressor", flag.ContinueOnError)
+	fs := flag.NewFlagSet("image_compressor", flag.ContinueOnError)
 	c := &Config{}
 	defInput := ExecDir()
 	defWorkers := DefaultWorkers()

@@ -1,4 +1,4 @@
-# MediaCompressor
+# ImageCompressor
 
 Пакетное сжатие семейного фото/видео архива: **фото/анимация → AVIF**, **видео → MP4 + AV1**,
 **визуально без потерь**, с **сохранением метаданных и времени**, **идемпотентно** и
@@ -13,7 +13,7 @@ Go сам не кодирует — он вызывает внешние бин�
 реализовано через `go:embed` + распаковку дерева в temp при запуске (аналог `sys._MEIPASS`),
 сохраняя структуру — поэтому `exiftool.exe` видит рядом `exiftool_files/` (Perl), а `avifenc.exe` самодостаточен.
 
-Уже **встроено** в `dist/mediacompressor.exe` (Windows, ~300 МБ): **`avifenc`** (статический, официальный
+Уже **встроено** в `dist/image_compressor.exe` (Windows, ~300 МБ): **`avifenc`** (статический, официальный
 релиз AOMediaCodec/libavif), **`exiftool`** (exe + дерево `exiftool_files/`) и **`ffmpeg`** (статическая
 сборка gyan.dev full: `libsvtav1`, `libaom-av1`, GPU-AV1). **Один exe полностью автономен: фото, видео и
 метаданные работают на любом Windows-ПК без установки чего-либо.** `ffprobe` не нужен и не встраивается —
@@ -26,7 +26,7 @@ Go сам не кодирует — он вызывает внешние бин�
 # avifenc (статический exe), exiftool (exe + папка exiftool_files/) и ffmpeg.exe
 # (статика, full-сборка) -> положить в internal/assets/tools/windows/, затем:
 go generate ./cmd/mediacompressor
-go build -trimpath -ldflags "-s -w" -o dist/mediacompressor.exe ./cmd/mediacompressor
+go build -trimpath -ldflags "-s -w" -o dist/image_compressor.exe ./cmd/mediacompressor
 ```
 
 Порядок поиска тулзы: `tools/` у exe → `bin/` у exe → каталог exe → `tools/` cwd → **встроенный (temp)** → `PATH`.
@@ -38,7 +38,7 @@ go build -trimpath -ldflags "-s -w" -o dist/mediacompressor.exe ./cmd/mediacompr
 go generate ./cmd/mediacompressor
 
 # 2) собрать exe
-go build -o dist/mediacompressor.exe ./cmd/mediacompressor
+go build -o dist/image_compressor.exe ./cmd/mediacompressor
 ```
 
 Кросс-сборка под Linux:
@@ -52,7 +52,7 @@ $env:GOOS="linux"; $env:CGO_ENABLED="0"; go build -o dist/mediacompressor ./cmd/
 подпапки**, спросив подтверждение один раз:
 
 ```
-mediacompressor.exe
+image_compressor.exe
 ```
 
 Полезные флаги (все опциональны — подобраны дефолтами, в основном для дебага):
@@ -78,6 +78,15 @@ mediacompressor.exe
 -v                   подробный лог
 ```
 
+### Остановка и продолжение
+
+- **Ctrl+C** — штатная остановка: текущие кодировки прерываются, их temps удаляются, уже
+  заменённые файлы записываются в БД до конца; в конце — сводка и сообщение «повторный запуск
+  продолжит с того же места». Случайно нажал — просто запусти ту же команду снова.
+- **Второй Ctrl+C** — немедленный выход (жёсткий). Данные всё равно в безопасности: журнал
+  `staged` + атомарные rename при следующем запуске дозавершают или откатывают прерванное.
+- Убийство процесса / выключение питания — тот же механизм `Recover()` + очистка temps при старте.
+
 Миграция со старой (Python) версии: положите рядом старый `image_compressor.db` — Go подхватит его,
 не будет заново сжимать уже сжатое Python'ом, а `--migrate` один раз приведёт старые выходы к AVIF/AV1.
 
@@ -86,7 +95,7 @@ mediacompressor.exe
 - **Живая строка статуса** в консоли: время, обработано N/M (%), счётчики (сжато/готово/не
   уменьшилось/переименовано/ошибки), сэкономленные МБ и МБ/с, ETA (по байтам). При перенаправлении
   в файл/pipe — компактные строки каждые 1000 файлов.
-- **Журнал `image_compressor.changes.log`** рядом с БД (обычный текст, колонки через таб, UTF-8 с BOM): дата,
+- **Журнал `image_compressor.log`** рядом с БД (обычный текст, колонки через таб, UTF-8 с BOM): дата,
   действие (сжат / не уменьшился / исправлено расширение / ошибка), чем было → чем стало, байты
   до/после/экономия, тип, формат, достигнутое качество.
 - **БД хранит фактическое качество результата** (колонка `achieved`: `q=85`, `crf=34 vmaf=97.2`) —

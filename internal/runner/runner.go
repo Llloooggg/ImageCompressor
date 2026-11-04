@@ -200,6 +200,9 @@ func (r *Runner) Run(ctx context.Context) error {
 	for _, f := range files {
 		f := f
 		g.Go(func() error {
+			if gctx.Err() != nil {
+				return nil // stop requested: don't start new files
+			}
 			r.process(gctx, f)
 			n := r.done.Add(1)
 			if tty {
@@ -389,6 +392,9 @@ func sameSize(a, b string) bool {
 }
 
 func (r *Runner) process(ctx context.Context, path string) {
+	if ctx.Err() != nil {
+		return // stop requested: leave the file untouched for the next run
+	}
 	res, err := detect.Detect(path)
 	if err != nil {
 		r.errored.Add(1)
@@ -489,6 +495,12 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 	default:
 		encErr = errors.New("unsupported media kind")
 	}
+	if ctx.Err() != nil {
+		// A stop request interrupted the encoder: not an error. Remove the
+		// partial temp; the original stays untouched, next run reprocesses it.
+		safefs.RemoveIfExists(tmp)
+		return
+	}
 	achieved := r.achievedFor(res.Kind, vinfo)
 	if errors.Is(encErr, media.ErrNotSmaller) {
 		safefs.RemoveIfExists(tmp)
@@ -560,7 +572,9 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 		return
 	}
 	newRel := r.rel(finalPath)
-	if err := r.store.CommitSwap(ctx, sid, newHash, newRel, res.Kind.String(), mediaFormatFor(res, finalPath), toolSelf, toolVersion, achieved); err != nil {
+	// Commit must land even if a stop request arrives right here: the rename
+	// already happened, so the DB record has to follow it (WithoutCancel).
+	if err := r.store.CommitSwap(context.WithoutCancel(ctx), sid, newHash, newRel, res.Kind.String(), mediaFormatFor(res, finalPath), toolSelf, toolVersion, achieved); err != nil {
 		r.errored.Add(1)
 		r.logf("commit %s: %v", rel, err)
 		return
@@ -602,11 +616,13 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 // ensureHonestExt renames a media file whose extension lies, EVEN when the
 // file is not compressed (user rule: lying extensions are always fixed —
 // viewers must never be handed a file whose bytes contradict its name).
+// Doubled/chained media extensions ("VID_x.mp4.mp4", "clip.mp4.mov" — noise
+// left by earlier tools' renames) are cleaned up the same way.
 // On a name collision the file is left untouched with a warning. DB
 // decisions are hash-based, so no stored-filename rewrite is required.
 // Call AFTER addSize (a rename would make the old path unstatable).
 func (r *Runner) ensureHonestExt(path string, res detect.Result) {
-	if !res.ExtensionLies {
+	if !res.ExtensionLies && !doubledMediaExt(path) {
 		return
 	}
 	honest := res.Format.HonestExt()
@@ -735,9 +751,39 @@ func mediaFormatFor(res detect.Result, finalPath string) string {
 	}
 }
 
+// replaceExt swaps the file's extension for ext, dropping the current one AND
+// any chained media extensions under it: "clip.mp4.mov" -> "clip"+ext (never
+// "clip.mp4"+ext), "liar.dat" -> "liar"+ext. Dots inside name segments
+// ("bandicam 2021-07-21 22-08-04-365", "photo.final") are left intact.
 func replaceExt(path, ext string) string {
-	base := path[:len(path)-len(filepath.Ext(path))]
+	base := path
+	if e := filepath.Ext(base); e != "" { // drop the current (lying or canonical) ext
+		if b := base[:len(base)-len(e)]; b != "" {
+			base = b
+		}
+	}
+	for { // drop chained leftovers like the ".mp4" in "clip.mp4.mov"
+		e := filepath.Ext(base)
+		if e == "" || !detect.IsMediaExt(e) {
+			break
+		}
+		b := base[:len(base)-len(e)]
+		if b == "" {
+			break
+		}
+		base = b
+	}
 	return base + ext
+}
+
+// doubledMediaExt catches extensions doubled by historical renames
+// ("VID_...mp4.mp4", "clip.mp4.mov"): two media extensions in a row at the end.
+func doubledMediaExt(path string) bool {
+	e := filepath.Ext(path)
+	if e == "" || !detect.IsMediaExt(e) {
+		return false
+	}
+	return detect.IsMediaExt(filepath.Ext(path[:len(path)-len(e)]))
 }
 
 // isOurArtifact skips the tool's own database (and WAL/SHM sidecars) and the
@@ -819,10 +865,10 @@ func (r *Runner) achievedFor(k detect.Kind, v media.VideoResult) string {
 }
 
 // changeLogPath puts the audit log next to the DB, sharing its base name:
-// <dir>/image_compressor.db -> <dir>/image_compressor.changes.log
+// <dir>/image_compressor.db -> <dir>/image_compressor.log
 // (plain tab-separated text: Notepad-friendly, spreadsheets by accident).
 func changeLogPath(dbPath string) string {
 	dir := filepath.Dir(dbPath)
 	base := strings.TrimSuffix(filepath.Base(dbPath), ".db")
-	return filepath.Join(dir, base+".changes.log")
+	return filepath.Join(dir, base+".log")
 }

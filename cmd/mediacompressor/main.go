@@ -31,6 +31,18 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// Ctrl+C = graceful stop (current temps cleaned, next run resumes).
+	// Second Ctrl+C = immediate exit — the staged journal + atomic renames mean
+	// even a hard kill cannot corrupt anything.
+	go func() {
+		<-ctx.Done()
+		ch := make(chan os.Signal, 1)
+		signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
+		defer signal.Stop(ch)
+		<-ch
+		fmt.Println("\nЖёсткая остановка (данные в безопасности — следующий запуск всё восстановит).")
+		os.Exit(1)
+	}()
 
 	if err := runMain(ctx, cfg); err != nil {
 		fmt.Fprintln(os.Stderr, "Ошибка:", err)
@@ -59,7 +71,7 @@ func runMain(ctx context.Context, cfg *config.Config) error {
 	if !cfg.InPlace() {
 		fmt.Printf("Выход: %s\n", cfg.Output)
 	} else {
-		fmt.Printf("Режим: на месте (исходники не удаляем до успеха)\n")
+		fmt.Printf("Режим: на месте\n")
 	}
 	fmt.Printf("БД:    %s\n", cfg.Database)
 	ladder := media.CRFLadder(cfg.VideoCRF)
@@ -78,10 +90,13 @@ func runMain(ctx context.Context, cfg *config.Config) error {
 	}
 
 	r := runner.New(cfg, st, loc)
-	if err := r.Run(ctx); err != nil {
+	if err := r.Run(ctx); err != nil && ctx.Err() == nil {
 		return err
 	}
 	fmt.Println(r.Summary())
+	if ctx.Err() != nil {
+		fmt.Println("\nОстановлено по запросу. Повторный запуск той же команды продолжит с того же места.")
+	}
 	return nil
 }
 
@@ -107,7 +122,7 @@ func warnTools(loc *tools.Locator) {
 }
 
 func confirm(ctx context.Context) bool {
-	fmt.Println("\nВнимание: файлы будут изменены на месте (с гарантиями). Продолжить? [y/N]: ")
+	fmt.Println("\nВнимание: файлы будут изменены на месте. Продолжить? [y/N]: ")
 	reader := bufio.NewReader(os.Stdin)
 	line, err := reader.ReadString('\n')
 	if ctx.Err() != nil {

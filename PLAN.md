@@ -147,7 +147,7 @@ run: Recover(staged) → CleanupTemps →
   флагом `--yes`. В конце — пауза при интерактивном запуске (чтобы увидеть статистику при двойном клике).
 - **Живой статус**: однострочный прогресс в консоли (время, n/total %, счётчики, экономия МБ и МБ/с,
   ETA по байтам); в pipe/файл — компактные строки каждые 1000 файлов.
-- **Журнал рядом с БД** (`<db-base>.changes.log`, обычный текст с колонками через таб, UTF-8 BOM): каждое изменение «чем было → чем
+- **Журнал рядом с БД** (`<db-base>.log`, обычный текст с колонками через таб, UTF-8 BOM): каждое изменение «чем было → чем
   стало → байты до/после → качество». **БД: колонка `achieved`** = фактическое качество результата.
 - **`--output` = полное зеркало**: в выход попадают ВСЕ файлы (не-медиа копируются как есть), повторный
   прогон докачивает зеркало инкрементально; output внутри input исключается из обхода.
@@ -177,7 +177,7 @@ run: Recover(staged) → CleanupTemps →
 ## 13. TODO-статус
 
 **Сделано (реализовано + тесты):**
-- (0) Сборка: `resource.syso` (иконка+версия) через `go generate`; `dist/mediacompressor.exe` (Windows,
+- (0) Сборка: `resource.syso` (иконка+версия) через `go generate`; `dist/image_compressor.exe` (Windows,
   со старой иконкой) и `dist/mediacompressor` (Linux). Иконка проверена в exe; сквозной прогон бинарника:
   фото 81.8KB→10.9KB (~87%).
 - (2) Перф: кэш «не уменьшилось» через `outcome=nochange` + `stamp` настроек — видео/фото не перекодируются
@@ -197,11 +197,19 @@ run: Recover(staged) → CleanupTemps →
   уже-честной копии после rename; guard: output внутри input исключён из обхода). Тесты gather:
   `TestGather_OutputMode_FullMirror`, `TestGather_OutputMode_HonestCopyReused`, `TestGather_OutputInsideInput_Excluded`.
 - (11) Живой статус в консоли (одна строка: время, %, счётчики, экономия МБ/МБ·с⁻¹, ETA по байтам;
-  TTY-detect через ModeCharDevice, без новых зависимостей) + **журнал `*.changes.log`** рядом с БД
+  TTY-detect через ModeCharDevice, без новых зависимостей) + **журнал `image_compressor.log`** рядом с БД
   (`internal/runner/changelog.go`, UTF-8 BOM, flush на каждую строку; все `r.logf` дублируются туда;
   sidecar журнала исключён из обхода `isOurArtifact`).
 - (12) БД: колонка `achieved` — фактическое качество результата (`q=85`, `crf=34 vmaf=97.2`);
   «оригинал» в БД не пишем (запись ключуется хэшем текущего файла — оригинала на диске уже нет).
+- (13) Цепочки расширений: `replaceExt` срезает ВСЕ хвостовые медиа-расширения ("x.mp4.mov" →
+  "x"+canon, никогда "x.mp4"+canon); удвоенные (".mp4.mp4") чистятся и на уже-сжатых файлах
+  (гейт `doubledMediaExt` в ensureHonestExt). Тесты `TestReplaceExtChain`,
+  `TestEnsureHonestExt_DoubledExt_Cleaned`.
+- (14) Штатная остановка: Ctrl+C = graceful (новые файлы не начинаются, прерванные кодировки
+  чистят temp без засчёта в ошибки, финальный COMMIT идёт через `context.WithoutCancel`);
+  второй Ctrl+C = немедленный выход (Recover()+staged-журнал гарантийны). Имя exe — `image_compressor.exe`
+  (как в Python-эре); журнал — `image_compressor.log` (без ".changes").
 
 **Осталось:**
 - (1) ~~Пользователь ставит~~ **Встроено в exe** (go:embed + temp-распаковка, как оригинал `--add-binary`):

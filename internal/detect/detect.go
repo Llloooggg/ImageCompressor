@@ -81,6 +81,22 @@ func (f Format) HonestExt() string {
 	return ""
 }
 
+// IsMediaExt reports whether ext (".jpg", "jpg", any case) is one of the known
+// media extensions. Used to strip extension CHAINS like ".mp4.mov" or the
+// doubled ".mp4.mp4" down to the real base name.
+func IsMediaExt(ext string) bool {
+	ext = strings.ToLower(ext)
+	if ext == ".m4v" { // common alias of the MP4 container
+		return true
+	}
+	for _, e := range extFor {
+		if e == ext {
+			return true
+		}
+	}
+	return false
+}
+
 // videoFormats are the containers we treat as video.
 var videoFormats = map[Format]bool{FmtMP4: true, FmtMOV: true, FmtMatroska: true, FmtWebM: true}
 

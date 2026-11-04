@@ -70,8 +70,8 @@
 
 ## Сборка / проверки
 
-- `go build -o dist/mediacompressor.exe ./cmd/mediacompressor` (Windows)
-- кросс-сборка: `$env:GOOS="linux"; $env:CGO_ENABLED="0"; go build -o dist/mediacompressor ./cmd/mediacompressor`
+- `go build -o dist/image_compressor.exe ./cmd/mediacompressor` (Windows)
+- кросс-сборка: `$env:GOOS="linux"; $env:CGO_ENABLED="0"; go build -o dist/image_compressor ./cmd/mediacompressor`
 - обязательно перед коммитом: `go vet ./...` и `go test ./...`
 - PowerShell: `CGO_ENABLED=0 ...` НЕ работает как префикс — пиши `$env:CGO_ENABLED="0"; go ...`
 
@@ -87,7 +87,7 @@
   несколько прогонов с разными crf. Дефолты качества: `--photo-q 85`, `--video-crf 28` (флор лестницы),
   `--video-vmaf-min 95`. Подтверждение перед мутированием (skip `--yes`); пауза в конце в TTY.
 - UX/учёт: живой однострочный статус в консоли (прогресс, экономия MB/s, ETA; в pipe — строки
-  каждые 1000 файлов); рядом с БД пишется `image_compressor.changes.log` (журнал «чем было → чем
+  каждые 1000 файлов); рядом с БД пишется `image_compressor.log` (журнал «чем было → чем
   стало → как изменился вес»); в БД колонка `achieved` = фактическое качество результата
   (`q=85`, `crf=34 vmaf=97.2`). `--output` = **полное зеркало** входа (не-медиа тоже копируются).
 - Не переусложнять. Оркестратор, а не реимплементация кодеков.
