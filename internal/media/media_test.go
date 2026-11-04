@@ -60,6 +60,27 @@ func TestCRFLadder(t *testing.T) {
 	}
 }
 
+// PhotoLadder is the stills mirror of CRFLadder: q steps DOWN (-6, -12),
+// floored at 61, no duplicates.
+func TestPhotoLadder(t *testing.T) {
+	tests := []struct {
+		base int
+		want []int
+	}{
+		{85, []int{85, 79, 73}},
+		{100, []int{100, 94, 88}},
+		{70, []int{70, 64, 61}}, // floored at 61, no duplicates
+		{66, []int{66, 61}},
+		{61, []int{61}},
+		{50, []int{61}}, // base below floor
+	}
+	for _, tt := range tests {
+		if got := PhotoLadder(tt.base); !reflect.DeepEqual(got, tt.want) {
+			t.Errorf("PhotoLadder(%d) = %v, want %v", tt.base, got, tt.want)
+		}
+	}
+}
+
 func TestWithCRFRebuild(t *testing.T) {
 	avail := map[string]bool{"av1_nvenc": true, "libsvtav1": true}
 	ch := Opts{VideoCRF: 28, Encoder: EncAuto}.BuildVideoChain(avail)

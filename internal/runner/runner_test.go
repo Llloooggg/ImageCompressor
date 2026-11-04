@@ -364,9 +364,9 @@ func TestReplaceExtChain(t *testing.T) {
 	tests := []struct {
 		path, ext, want string
 	}{
-		{"a.mp4.mov", ".mp4", "a.mp4"},          // chained exts collapse into one
-		{"b.jpg.jpg", ".avif", "b.avif"},        // doubled ext fully replaced
-		{"liar.dat", ".jpg", "liar.jpg"},        // unknown ext dropped as before
+		{"a.mp4.mov", ".mp4", "a.mp4"},                   // chained exts collapse into one
+		{"b.jpg.jpg", ".avif", "b.avif"},                 // doubled ext fully replaced
+		{"liar.dat", ".jpg", "liar.jpg"},                 // unknown ext dropped as before
 		{"photo.final.jpg", ".avif", "photo.final.avif"}, // dots inside names stay
 		{"bandicam 2021-07-21 22-08-04-365.mp4", ".mp4", "bandicam 2021-07-21 22-08-04-365.mp4"},
 		{"plain", ".mp4", "plain.mp4"},

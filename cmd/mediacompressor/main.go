@@ -79,8 +79,17 @@ func runMain(ctx context.Context, cfg *config.Config) error {
 	if cfg.VideoVMAF > 0 {
 		guardTag = fmt.Sprintf(", vmaf>=%.0f", cfg.VideoVMAF)
 	}
-	fmt.Printf("Фото:  AVIF (q=%d%s)   Видео: MP4+AV1 (crf %d→%d авто-лестница%s, %s)\n",
-		cfg.PhotoQ, losslessTag(cfg.PhotoLoss), ladder[0], ladder[len(ladder)-1], guardTag, cfg.VideoEnc)
+	pl := media.PhotoLadder(cfg.PhotoQ)
+	photoDesc := fmt.Sprintf("lossless q=%d", cfg.PhotoQ)
+	if !cfg.PhotoLoss {
+		pguard := ""
+		if cfg.PhotoVMAF > 0 {
+			pguard = fmt.Sprintf(", vmaf>=%.0f", cfg.PhotoVMAF)
+		}
+		photoDesc = fmt.Sprintf("q %d→%d авто-лестница%s", pl[0], pl[len(pl)-1], pguard)
+	}
+	fmt.Printf("Фото:  AVIF (%s)   Видео: MP4+AV1 (crf %d→%d авто-лестница%s, %s)\n",
+		photoDesc, ladder[0], ladder[len(ladder)-1], guardTag, cfg.VideoEnc)
 
 	if !cfg.DryRun && !cfg.Yes {
 		if !confirm(ctx) {
@@ -132,13 +141,6 @@ func confirm(ctx context.Context) bool {
 		return false
 	}
 	return len(line) > 0 && (line[0] == 'y' || line[0] == 'Y')
-}
-
-func losslessTag(l bool) string {
-	if l {
-		return ", lossless"
-	}
-	return ""
 }
 
 func pauseIfInteractive() {

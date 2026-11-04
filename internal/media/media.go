@@ -35,22 +35,145 @@ const (
 type Opts struct {
 	PhotoQ       int     // 0..100
 	PhotoLoss    bool    // pixel-exact AVIF
+	PhotoVMAFMin float64 // min acceptable VMAF for ESCALATED photo levels (0 disables the guard)
 	VideoCRF     int     // CRF floor of the ladder (escalation +6/+12, capped at 45)
 	VideoVMAFMin float64 // min acceptable VMAF for ESCALATED levels (0 disables the guard)
 	Encoder      string
+}
+
+// PhotoResult reports what EncodeImage actually achieved when it kept a temp:
+// the effective q of the winning encode (after ladder + guard) and the measured
+// VMAF against the original (-1 = never measured). The runner stores it so
+// future runs know at which quality the photo already sits.
+type PhotoResult struct {
+	Q    int
+	VMAF float64
+}
+
+// PhotoLadder returns the per-file q levels tried within one run: base,
+// base-6, base-12 (floored at 61). Mirror image of CRFLadder for stills:
+// already-compressed sources (messenger/social photos) cannot shrink at the
+// base quality, only deeper levels can beat them honestly.
+func PhotoLadder(base int) []int {
+	base = clamp(base, 61, 100)
+	levels := []int{base}
+	for _, step := range []int{6, 12} {
+		n := clamp(base-step, 61, 100)
+		if n != levels[len(levels)-1] {
+			levels = append(levels, n)
+		}
+	}
+	return levels
 }
 
 // EncodeImage stills -> AVIF (CPU: avifenc preferred, ffmpeg fallback). GPU is a
 // video concept; still-image AVIF stays CPU regardless of --gpu. avifenc only
 // decodes JPEG/PNG, so on any avifenc failure (e.g. WebP/HEIC input) we fall
 // back to ffmpeg, which decodes everything.
-func EncodeImage(ctx context.Context, loc *tools.Locator, o Opts, src, tmp string) error {
+//
+// Same per-file quality matching as video: the first ladder level (see
+// PhotoLadder) that produces a file smaller than origSize wins. The BASE level
+// is taken as-is (it is the user's quality order); an ESCALATED winner is
+// verified against the original with libvmaf (single-frame) and, if the
+// difference is visible (VMAF < PhotoVMAFMin), we bisection-search the q band
+// for a point that is BOTH smaller AND imperceptible. No such point -> the
+// file is left untouched (ErrNotSmaller): we never trade visible quality for
+// size. Lossless mode has no ladder (quality is fixed by definition).
+func EncodeImage(ctx context.Context, loc *tools.Locator, o Opts, src, tmp string, origSize int64) (PhotoResult, error) {
+	attempt := func(q int) (kept, ran bool, lastErr error) {
+		if err := encodeImageAt(ctx, loc, o, q, src, tmp); err != nil {
+			return false, false, err
+		}
+		ran = true // encoder produced a file successfully
+		if st, serr := os.Stat(tmp); serr == nil && st.Size() < origSize {
+			return true, true, nil // real win: keep tmp
+		}
+		os.Remove(tmp) // ran fine but no reduction
+		return false, ran, nil
+	}
+	score := func() float64 {
+		ff := loc.FFmpeg()
+		if ff == "" {
+			return -1 // no ffmpeg for the metric: honest fallback (do not block)
+		}
+		return vmafScore(ctx, loc, ff, tmp, src)
+	}
+
+	if o.PhotoLoss {
+		kept, ran, err := attempt(o.PhotoQ)
+		if kept {
+			return PhotoResult{Q: o.PhotoQ, VMAF: -1}, nil
+		}
+		if !ran && err != nil {
+			return PhotoResult{}, err
+		}
+		return PhotoResult{}, ErrNotSmaller
+	}
+
+	ladder := PhotoLadder(o.PhotoQ)
+	anyRan := false
+	var lastErr error
+	for i, lvl := range ladder {
+		kept, ran, err := attempt(lvl)
+		anyRan = anyRan || ran
+		if err != nil {
+			lastErr = err
+		}
+		if !kept {
+			continue
+		}
+		if i == 0 || o.PhotoVMAFMin <= 0 {
+			return PhotoResult{Q: lvl, VMAF: -1}, nil // base level: user's order; or guard disabled
+		}
+		if s := score(); s < 0 || s >= o.PhotoVMAFMin {
+			return PhotoResult{Q: lvl, VMAF: s}, nil // passed the floor (no metric -> honest fallback)
+		}
+		// Smaller but visibly worse: bisect between this q (small, visible)
+		// and the previous higher q (invisible, but it did not shrink).
+		os.Remove(tmp)
+		lo, hi := lvl, ladder[i-1] // q goes DOWN = more compression
+		for probe := 0; probe < 4; probe++ {
+			mid := (lo + hi) / 2
+			if mid <= lo || mid >= hi {
+				break
+			}
+			k2, ran2, e2 := attempt(mid)
+			anyRan = anyRan || ran2
+			if e2 != nil {
+				lastErr = e2
+			}
+			if !k2 {
+				hi = mid // still not smaller: compress harder
+				continue
+			}
+			if s2 := score(); s2 < 0 || s2 >= o.PhotoVMAFMin {
+				return PhotoResult{Q: mid, VMAF: s2}, nil // both smaller and imperceptible
+			}
+			os.Remove(tmp)
+			lo = mid // smaller but visible: pull quality back up
+		}
+		// No point in the band was both smaller AND imperceptible -> leave
+		// the file alone; deeper levels only trade more quality.
+		return PhotoResult{}, ErrNotSmaller
+	}
+	if anyRan {
+		return PhotoResult{}, ErrNotSmaller
+	}
+	if lastErr != nil {
+		return PhotoResult{}, lastErr
+	}
+	return PhotoResult{}, ErrNotSmaller
+}
+
+// encodeImageAt encodes one still at quality q (0..100), avifenc first then
+// ffmpeg. Same tool-quirk handling as the old single-shot EncodeImage.
+func encodeImageAt(ctx context.Context, loc *tools.Locator, o Opts, q int, src, tmp string) error {
 	if a := loc.Avifenc(); a != "" {
 		args := []string{"--speed", "6"}
 		if o.PhotoLoss {
 			args = append(args, "--lossless")
 		} else {
-			args = append(args, "-q", strconv.Itoa(clamp(o.PhotoQ, 0, 100)))
+			args = append(args, "-q", strconv.Itoa(clamp(q, 0, 100)))
 		}
 		args = append(args, src, tmp)
 		if err := run(loc, a, args...); err == nil {
@@ -60,11 +183,11 @@ func EncodeImage(ctx context.Context, loc *tools.Locator, o Opts, src, tmp strin
 		}
 		os.Remove(tmp) // partial output from the failed attempt
 	}
-	return encodeImageFFmpeg(ctx, loc, o, src, tmp)
+	return encodeImageFFmpeg(ctx, loc, o, q, src, tmp)
 }
 
 // encodeImageFFmpeg is the fallback: decodes any image via ffmpeg and muxes AVIF.
-func encodeImageFFmpeg(ctx context.Context, loc *tools.Locator, o Opts, src, tmp string) error {
+func encodeImageFFmpeg(ctx context.Context, loc *tools.Locator, o Opts, q int, src, tmp string) error {
 	ff := loc.FFmpeg()
 	if ff == "" {
 		return fmt.Errorf("no encoder: neither avifenc nor ffmpeg found")
@@ -72,7 +195,7 @@ func encodeImageFFmpeg(ctx context.Context, loc *tools.Locator, o Opts, src, tmp
 	args := []string{
 		"-y", "-i", src,
 		"-c:v", "libaom-av1", "-still-picture", "1",
-		"-crf", strconv.Itoa(aomCRFFromQ(o.PhotoQ, o.PhotoLoss)),
+		"-crf", strconv.Itoa(aomCRFFromQ(q, o.PhotoLoss)),
 		"-pix_fmt", "yuv420p",
 		"-map_metadata", "-1",
 		tmp,
@@ -301,7 +424,7 @@ func EncodeVideo(ctx context.Context, loc *tools.Locator, o Opts, chain VideoCha
 				if i == 0 || o.VideoVMAFMin <= 0 {
 					return true, VideoResult{CRF: lvl, VMAF: -1}, true, nil // base level: user's order; or guard disabled
 				}
-				score := videoVMAF(ctx, loc, ff, tmp, src)
+				score := vmafScore(ctx, loc, ff, tmp, src)
 				if score < 0 || score >= o.VideoVMAFMin {
 					return true, VideoResult{CRF: lvl, VMAF: score}, true, nil // passed the floor (libvmaf missing -> honest fallback)
 				}
@@ -323,7 +446,7 @@ func EncodeVideo(ctx context.Context, loc *tools.Locator, o Opts, chain VideoCha
 						lo = mid // still not smaller: push crf up
 						continue
 					}
-					s2 := videoVMAF(ctx, loc, ff, tmp, src)
+					s2 := vmafScore(ctx, loc, ff, tmp, src)
 					if s2 < 0 || s2 >= o.VideoVMAFMin {
 						return true, VideoResult{CRF: mid, VMAF: s2}, true, nil // both smaller and imperceptible
 					}
@@ -368,11 +491,12 @@ func EncodeVideo(ctx context.Context, loc *tools.Locator, o Opts, chain VideoCha
 	return VideoResult{}, ErrNotSmaller
 }
 
-// videoVMAF scores candidate against the original file (reference) with
-// libvmaf. >=95 was measured on this archive as "difference invisible to the
-// eye". Returns -1 when libvmaf is unavailable or the pass failed — callers
-// must not block compression on a metrics-tool hiccup (honest fallback).
-func videoVMAF(ctx context.Context, loc *tools.Locator, ff, candidate, original string) float64 {
+// vmafScore scores candidate against the original file (reference) with
+// libvmaf. Works for videos and single frames (stills). >=95 was measured on
+// this archive as "difference invisible to the eye". Returns -1 when libvmaf
+// is unavailable or the pass failed — callers must not block compression on a
+// metrics-tool hiccup (honest fallback).
+func vmafScore(ctx context.Context, loc *tools.Locator, ff, candidate, original string) float64 {
 	out, err := loc.Run(ctx, ff, "-hide_banner", "-i", candidate, "-i", original,
 		"-lavfi", "libvmaf", "-f", "null", "-")
 	if err != nil {

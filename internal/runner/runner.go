@@ -33,22 +33,22 @@ const toolVersion = "0.1.0"
 const toolSelf = "mediacompressor"
 
 type Runner struct {
-	cfg     *config.Config
-	store   *store.Store
-	loc     *tools.Locator
-	opts    media.Opts
-	vchain  media.VideoChain
-	exif    string
-	legacy  map[string]struct{}
+	cfg         *config.Config
+	store       *store.Store
+	loc         *tools.Locator
+	opts        media.Opts
+	vchain      media.VideoChain
+	exif        string
+	legacy      map[string]struct{}
 	processRoot string
 	hasAvifenc  bool
 	hasFFmpeg   bool
 	changes     *changeLog
 
 	processed, skipDone, skipNotSmaller, skipUnknown, fixedExt, errored atomic.Int64
-	origBytes, newBytes, scanBytes                                atomic.Int64
-	done                                                          atomic.Int64
-	total                                                         int
+	origBytes, newBytes, scanBytes                                      atomic.Int64
+	done                                                                atomic.Int64
+	total                                                               int
 }
 
 func New(cfg *config.Config, st *store.Store, loc *tools.Locator) *Runner {
@@ -56,7 +56,7 @@ func New(cfg *config.Config, st *store.Store, loc *tools.Locator) *Runner {
 		cfg:        cfg,
 		store:      st,
 		loc:        loc,
-		opts:       media.Opts{PhotoQ: cfg.PhotoQ, PhotoLoss: cfg.PhotoLoss, VideoCRF: cfg.VideoCRF, VideoVMAFMin: cfg.VideoVMAF, Encoder: cfg.VideoEnc},
+		opts:       media.Opts{PhotoQ: cfg.PhotoQ, PhotoLoss: cfg.PhotoLoss, PhotoVMAFMin: cfg.PhotoVMAF, VideoCRF: cfg.VideoCRF, VideoVMAFMin: cfg.VideoVMAF, Encoder: cfg.VideoEnc},
 		exif:       loc.Exiftool(),
 		hasAvifenc: loc.Avifenc() != "",
 		hasFFmpeg:  loc.FFmpeg() != "",
@@ -65,7 +65,8 @@ func New(cfg *config.Config, st *store.Store, loc *tools.Locator) *Runner {
 
 // stampFor fingerprints the settings that decide "can this shrink?". A nochange
 // record with a matching stamp is skipped on later runs; a different stamp makes
-// us re-evaluate (so changing --photo-q/--video-crf/encoder takes effect).
+// us re-evaluate (so changing --photo-q/--photo-vmaf-min/--video-crf/encoder
+// takes effect).
 func (r *Runner) stampFor(k detect.Kind) string {
 	switch k {
 	case detect.KindVideo:
@@ -73,7 +74,7 @@ func (r *Runner) stampFor(k detect.Kind) string {
 	case detect.KindAnimated:
 		return fmt.Sprintf("anim|%d|%v|avifenc=%v|ff=%v", r.opts.PhotoQ, r.opts.PhotoLoss, r.hasAvifenc, r.hasFFmpeg)
 	default:
-		return fmt.Sprintf("img|%d|%v|avifenc=%v|ff=%v", r.opts.PhotoQ, r.opts.PhotoLoss, r.hasAvifenc, r.hasFFmpeg)
+		return fmt.Sprintf("img|%d|%.0f|%v|avifenc=%v|ff=%v", r.opts.PhotoQ, r.opts.PhotoVMAFMin, r.opts.PhotoLoss, r.hasAvifenc, r.hasFFmpeg)
 	}
 }
 
@@ -481,13 +482,14 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 
 	var encErr error
 	var vinfo media.VideoResult
+	var pinfo media.PhotoResult
 	var origSize int64
 	if oi, err := os.Stat(path); err == nil {
 		origSize = oi.Size()
 	}
 	switch res.Kind {
 	case detect.KindImage:
-		encErr = media.EncodeImage(ctx, r.loc, r.opts, path, tmp)
+		pinfo, encErr = media.EncodeImage(ctx, r.loc, r.opts, path, tmp, origSize)
 	case detect.KindAnimated:
 		encErr = media.EncodeAnimated(ctx, r.loc, r.opts, path, tmp)
 	case detect.KindVideo:
@@ -501,7 +503,7 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 		safefs.RemoveIfExists(tmp)
 		return
 	}
-	achieved := r.achievedFor(res.Kind, vinfo)
+	achieved := r.achievedFor(res.Kind, vinfo, pinfo)
 	if errors.Is(encErr, media.ErrNotSmaller) {
 		safefs.RemoveIfExists(tmp)
 		r.skipNotSmaller.Add(1)
@@ -844,7 +846,7 @@ func (r *Runner) logf(format string, v ...any) {
 // achievedFor renders the actual result quality stored in the DB ("achieved"
 // column) — for future runs it answers "at what quality does this file already
 // sit, is there room to squeeze further?".
-func (r *Runner) achievedFor(k detect.Kind, v media.VideoResult) string {
+func (r *Runner) achievedFor(k detect.Kind, v media.VideoResult, p media.PhotoResult) string {
 	switch k {
 	case detect.KindVideo:
 		if v.CRF == 0 {
@@ -854,7 +856,15 @@ func (r *Runner) achievedFor(k detect.Kind, v media.VideoResult) string {
 			return fmt.Sprintf("crf=%d vmaf=%.1f", v.CRF, v.VMAF)
 		}
 		return fmt.Sprintf("crf=%d", v.CRF)
-	case detect.KindImage, detect.KindAnimated:
+	case detect.KindImage:
+		if p.Q == 0 {
+			return ""
+		}
+		if p.VMAF >= 0 {
+			return fmt.Sprintf("q=%d vmaf=%.1f", p.Q, p.VMAF)
+		}
+		return fmt.Sprintf("q=%d", p.Q)
+	case detect.KindAnimated:
 		if r.opts.PhotoLoss {
 			return "lossless"
 		}

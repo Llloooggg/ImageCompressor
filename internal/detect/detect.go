@@ -43,19 +43,19 @@ func (k Kind) String() string {
 type Format string
 
 const (
-	FmtUnknown Format = "unknown"
-	FmtJPEG    Format = "jpeg"
-	FmtPNG     Format = "png"
-	FmtWebP    Format = "webp"
-	FmtGIF     Format = "gif"
-	FmtAVIF    Format = "avif"
-	FmtHEIC    Format = "heic"
-	FmtBMP     Format = "bmp"
-	FmtTIFF    Format = "tiff"
-	FmtMP4     Format = "mp4"
-	FmtMOV     Format = "mov"
+	FmtUnknown  Format = "unknown"
+	FmtJPEG     Format = "jpeg"
+	FmtPNG      Format = "png"
+	FmtWebP     Format = "webp"
+	FmtGIF      Format = "gif"
+	FmtAVIF     Format = "avif"
+	FmtHEIC     Format = "heic"
+	FmtBMP      Format = "bmp"
+	FmtTIFF     Format = "tiff"
+	FmtMP4      Format = "mp4"
+	FmtMOV      Format = "mov"
 	FmtMatroska Format = "mkv"
-	FmtWebM    Format = "webm"
+	FmtWebM     Format = "webm"
 )
 
 var extFor = map[Format]string{

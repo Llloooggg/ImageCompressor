@@ -30,8 +30,8 @@ func NewLocator() *Locator {
 	return &Locator{
 		exeDir: execDir(),
 		cwdDir: func() string { wd, _ := os.Getwd(); return wd }(),
-		cache: map[string]string{},
-		miss:  map[string]bool{},
+		cache:  map[string]string{},
+		miss:   map[string]bool{},
 	}
 }
 
