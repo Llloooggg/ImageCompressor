@@ -9,8 +9,9 @@ import (
 	"time"
 )
 
-// changeLog is an append-only audit file (TSV, Excel-friendly) that lives next
-// to the DB: what was converted into what, size before/after, achieved quality.
+// changeLog is an append-only audit log next to the DB: what was converted
+// into what, size before/after, achieved quality. Plain text, columns split by
+// tabs (opens fine in Notepad; Excel can too, but nothing depends on it).
 // One row per mutation (сжат / не уменьшился / исправлено расширение / ошибка).
 // Rows are flushed immediately so the log survives even a process kill.
 type changeLog struct {
@@ -21,7 +22,8 @@ type changeLog struct {
 
 const changeLogHeader = "Дата\tДействие\tИсходник\tРезультат\tБыло,байт\tСтало,байт\tЭкономия,байт\tТип\tФормат\tКачество\tКомментарий"
 
-// openChangeLog appends to path (UTF-8 BOM + header written once for Excel).
+// openChangeLog appends to path (UTF-8 BOM + header written once so any
+// viewer shows Cyrillic correctly and the column names are visible).
 func openChangeLog(path string) (*changeLog, error) {
 	fresh := false
 	if _, err := os.Stat(path); err != nil {

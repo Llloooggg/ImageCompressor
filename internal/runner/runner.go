@@ -818,10 +818,11 @@ func (r *Runner) achievedFor(k detect.Kind, v media.VideoResult) string {
 	}
 }
 
-// changeLogPath puts the audit TSV next to the DB, sharing its base name:
-// <dir>/image_compressor.db -> <dir>/image_compressor.changes.tsv.
+// changeLogPath puts the audit log next to the DB, sharing its base name:
+// <dir>/image_compressor.db -> <dir>/image_compressor.changes.log
+// (plain tab-separated text: Notepad-friendly, spreadsheets by accident).
 func changeLogPath(dbPath string) string {
 	dir := filepath.Dir(dbPath)
 	base := strings.TrimSuffix(filepath.Base(dbPath), ".db")
-	return filepath.Join(dir, base+".changes.tsv")
+	return filepath.Join(dir, base+".changes.log")
 }
