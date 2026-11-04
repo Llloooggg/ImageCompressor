@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/Llloooggg/ImageCompressor/internal/assets"
 	"github.com/Llloooggg/ImageCompressor/internal/config"
 	"github.com/Llloooggg/ImageCompressor/internal/runner"
 	"github.com/Llloooggg/ImageCompressor/internal/store"
@@ -44,6 +45,7 @@ func runMain(ctx context.Context, cfg *config.Config) error {
 	}
 
 	loc := tools.NewLocator()
+	defer assets.Cleanup()
 	warnTools(loc)
 
 	st, err := store.Open(ctx, cfg.Database)

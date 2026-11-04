@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+
+	"github.com/Llloooggg/ImageCompressor/internal/assets"
 )
 
 // Locator caches resolved tool paths.
@@ -19,6 +21,9 @@ type Locator struct {
 	mu     sync.Mutex
 	cache  map[string]string
 	miss   map[string]bool
+
+	embeddedOnce sync.Once
+	embeddedDir  string
 }
 
 func NewLocator() *Locator {
@@ -28,6 +33,13 @@ func NewLocator() *Locator {
 		cache: map[string]string{},
 		miss:  map[string]bool{},
 	}
+}
+
+// embedded returns the runtime-extracted embedded helper tools dir (Windows),
+// materialized on first use. Empty on other platforms.
+func (l *Locator) embedded() string {
+	l.embeddedOnce.Do(func() { l.embeddedDir = assets.Extract() })
+	return l.embeddedDir
 }
 
 // Resolve returns an absolute path to a tool, or "" if not found. It prefers a
@@ -67,6 +79,11 @@ func (l *Locator) findBundled(exe string) string {
 	}
 	if l.cwdDir != "" && l.cwdDir != l.exeDir {
 		bases = append(bases, filepath.Join(l.cwdDir, "tools"), filepath.Join(l.cwdDir, "bin"))
+	}
+	// embedded (extracted to temp) as the last bundled source — this is what
+	// makes the single .exe self-contained for avifenc/exiftool.
+	if e := l.embedded(); e != "" {
+		bases = append(bases, e)
 	}
 	for _, b := range bases {
 		p := filepath.Join(b, exe)

@@ -37,12 +37,20 @@
   AV1/AVIF на чистом Go.
 - Платформенно-зависимое (fsync каталога) — через build tags (`//go:build unix` / `//go:build !unix`).
 
-## Обязательные внешние утилиты (ставит пользователь — см. README.md)
+## Внешние утилиты: ВСТРАИВАТЬ в exe (не заставлять юзера ставить)
 
-- **ffmpeg/ffprobe** — видео/AV1, AVIF-fallback.
-- **exiftool** — **обязателен** для переноса метаданных (EXIF/ICC/XMP); без него они теряются.
-- **avifenc** — **настоятельно рекомендуется** для оптимального AVIF фото/анимации (иначе ffmpeg-fallback).
-  Искать/предлагать в `tools/` рядом с exe или в PATH; при запуске печатать предупреждение, если чего-то нет.
+По правилам проекта помощники-кодеки **пекутся в exe** (как оригинал `--add-binary tools/*.exe`), через
+`go:embed all:internal/assets/tools/windows` + распаковку дерева в temp при старте (аналог `_MEIPASS`).
+`Locator` ищет: `tools/` у exe → `bin/` → каталог exe → `tools/` cwd → **встроенный temp** → `PATH`.
+
+- **`avifenc`** (статический, официальный AOMediaCodec/libavif) — **встроен**. Фото/анимация самодостаточны.
+- **`exiftool`** (exe + дерево `exiftool_files/` с Perl) — **встроен** (структура дерева обязательна!).
+- **`ffmpeg`/`ffprobe`** (видео/AV1) — по умолчанию **внешняя** (большая); ищется в `PATH`/`tools/`.
+  Полная автономность видео: положить `ffmpeg.exe`/`ffprobe.exe` в `internal/assets/tools/windows/` и пересобрать.
+- Бинарники в `internal/assets/tools/windows/` **не коммитить** (gitignore), но они должны лежать на
+  диске перед `go build`, иначе не встраиваются. Скачивать: avifenc — GitHub Releases AOMediaCodec/libavif
+  (`windows-artifacts.zip`, статический); exiftool — SourceForge (BITS/`Start-BitsTransfer` обходит JS-заглушку;
+  обычный curl/winget упирается в interstitial).
 
 ## Форматы (окончательно)
 

@@ -170,7 +170,10 @@ run: Recover(staged) → CleanupTemps →
 - (7) Анимация: `avifenc` (нативный GIF) с фолбеком на ffmpeg в `EncodeAnimated`.
 
 **Осталось:**
-- (1) Пользователь ставит **exiftool** (обяз.) и **avifenc** (рек.) — см. README.md/AGENTS.md (уже прописано).
+- (1) ~~Пользователь ставит~~ **Встроено в exe** (go:embed + temp-распаковка, как оригинал `--add-binary`):
+  `avifenc` (статический) и `exiftool` (exe+`exiftool_files/`) запечены в Windows-сборку — фото/анимация/
+  метаданные полностью самодостаточны (проверено: EXIF `Make/Model/DateTimeOriginal` перенесён в AVIF).
+  `ffmpeg` — внешняя (видео); опционально встраивается копированием в `internal/assets/tools/windows/`.
 - (3) e2e **`--migrate`** и полный e2e на **реальном архиве** пользователя (unit-логика миграции покрыта
   `TestLegacyAdoption`). Прогнать на реальном архиве, когда он будет предоставлен.
 - Опционально: сборочный пайплайн иконок (`go generate` → `*.syso`), если понадобится CI-сборка.

@@ -10,6 +10,11 @@
 # generated Windows resource (recreate with `go generate`)
 *.syso
 
+# embedded helper binaries (avifenc/exiftool+perl tree) — supplied at build time,
+# baked into the exe via go:embed, NOT committed. Keep only the placeholder.
+internal/assets/tools/windows/*
+!internal/assets/tools/windows/README.txt
+
 # tool runtime artifacts (these live in the user's archive, never in the repo)
 image_compressor.db
 image_compressor.db-wal

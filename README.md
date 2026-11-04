@@ -6,20 +6,32 @@
 
 Дизайн и решения — в [`PLAN.md`](PLAN.md); правила для агентов — в [`AGENTS.md`](AGENTS.md).
 
-## Обязательные внешние утилиты (нужно установить самому)
+## Внешние утилиты и встраивание в exe
 
-Go сам кодирует не умеет — он вызывает внешние бинарники (как старая версия бандлила cjpeg/cwebp).
-Ищем их в `PATH` или в папке **`tools/` рядом с exe**.
+Go сам не кодирует — он вызывает внешние бинарники. **По правилам проекта помощники-кодеки
+вшиваются прямо в `.exe`** (как оригинал делал `--add-binary "tools/*.exe:tools"` для cjpeg/cwebp):
+реализовано через `go:embed` + распаковку дерева в temp при запуске (аналог `sys._MEIPASS`),
+сохраняя структуру — поэтому `exiftool.exe` видит рядом `exiftool_files/` (Perl), а `avifenc.exe` самодостаточен.
 
-| Утилита | Нужна для | Статус | Установка |
-|---|---|---|---|
-| **ffmpeg** | видео/AV1, AVIF-fallback | обычно уже есть | `winget install Gyan.FFmpeg` |
-| **ffprobe** | уточнение потоков видео | идёт в комплекте ffmpeg | — |
-| **exiftool** | **перенос метаданных (EXIF/ICC/XMP)** — без него они теряются | **обязательна** | `winget install ExifTool.ExifTool` |
-| **avifenc** | оптимальный AVIF для фото/анимации | **настоятельно рекомендуется** | бинарник из релизов [libaom-av1/avif](https://github.com/AOMediaCodec/libavif) в `tools/` |
+Уже **встроено** в `dist/mediacompressor.exe` (Windows): **`avifenc`** (статический, официальный релиз
+AOMediaCodec/libavif) и **`exiftool`** (exe + дерево `exiftool_files/`). Это делает путь **фото/анимация +
+метаданные полностью самодостаточным** — на другом ПК ничего ставить не нужно.
 
-Без `avifenc` AVIF строится через ffmpeg-fallback — работает, но качество/размер хуже и медленнее.
-При запуске утилита печатает предупреждение о отсутствующих инструментах.
+Самодостаточность обеспечивается на этапе сборки: бинарники кладутся в `internal/assets/tools/windows/`
+и **не хранятся в git** (`.gitignore`). Положить и пересобрать:
+
+```powershell
+# avifenc (статический exe) и exiftool (exe + папка exiftool_files/) -> в дерево встраивания
+# (ffmpeg можно встроить тем же способом, см. ниже)
+go generate ./cmd/mediacompressor
+go build -trimpath -ldflags "-s -w" -o dist/mediacompressor.exe ./cmd/mediacompressor
+```
+
+**ffmpeg / ffprobe** (для видео/AV1) — большая зависимость, **не вшита по умолчанию**: ищется в `PATH`
+или в `tools/` рядом с exe. Хочешь полностью автономный видео-путь — положи `ffmpeg.exe`+`ffprobe.exe`
+в `internal/assets/tools/windows/` и пересобери (exe станет ~130–150 МБ). Для фото это не нужно.
+
+Порядок поиска тулзы: `tools/` у exe → `bin/` у exe → каталог exe → `tools/` cwd → **встроенный (temp)** → `PATH`.
 
 ## Сборка (Windows)
 
