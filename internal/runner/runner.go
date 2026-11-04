@@ -212,7 +212,7 @@ func (r *Runner) gather(ctx context.Context) ([]string, error) {
 		// Incremental output mode: if the honest final output already exists
 		// (complete — swaps are atomic renames), this input is already done:
 		// re-copying would resurrect raw originals and force a full re-encode.
-		if final := r.finalPath(dpath, res); existsFile(final) {
+		if final := r.finalPath(dpath, res); fileExists(final) {
 			r.skipDone.Add(1)
 			r.addSize(p, final)
 			continue
@@ -224,14 +224,18 @@ func (r *Runner) gather(ctx context.Context) ([]string, error) {
 			log.Printf("copy %s: %v", p, err)
 			continue
 		}
+		// Output mode: fs times must mirror the originals (rule: preserve
+		// timestamps). CopyFileBytes moves bytes only; without this the swaps
+		// below would propagate the fresh (copy-time) stamps instead.
+		if err := meta.CopyFileTimes(p, dpath); err != nil {
+			logf(r.cfg, "copy times %s: %v", rel, err)
+		}
+		if err := meta.CopyBirthTime(p, dpath); err != nil {
+			logf(r.cfg, "copy birthtime %s: %v", rel, err)
+		}
 		dest = append(dest, dpath)
 	}
 	return dest, nil
-}
-
-func existsFile(p string) bool {
-	st, err := os.Stat(p)
-	return err == nil && !st.IsDir()
 }
 
 func (r *Runner) process(ctx context.Context, path string) {
@@ -306,6 +310,10 @@ func (r *Runner) legacyNeedsMigrate(h string) bool {
 
 func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res detect.Result) {
 	finalPath := r.finalPath(path, res) // honest extension target
+	// NTFS creation time must be captured BEFORE the swap: when finalPath ==
+	// path (same-name replace, e.g. mp4->mp4) the original is gone by the
+	// time we would otherwise read it back (the swap left the temp's birth).
+	srcBirth, _ := meta.BirthTimeOf(path)
 	tmp, err := safefs.TempName(finalPath)
 	if err != nil {
 		r.errored.Add(1)
@@ -404,7 +412,8 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 	}
 
 	// Restore NTFS creation time onto the swapped-in file (Windows; no-op elsewhere).
-	if err := meta.CopyBirthTime(path, finalPath); err != nil {
+	// Uses the pre-swap capture so same-name swaps (mp4->mp4) stay honest too.
+	if err := meta.SetBirthTime(finalPath, srcBirth); err != nil {
 		logf(r.cfg, "birthtime %s: %v", newRel, err)
 	}
 

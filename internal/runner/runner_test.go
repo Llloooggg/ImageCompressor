@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/Llloooggg/ImageCompressor/internal/config"
 	"github.com/Llloooggg/ImageCompressor/internal/store"
@@ -124,5 +125,48 @@ func TestRecover_TmpGarbage_IsDiscarded(t *testing.T) {
 	rows, _ := st.PendingStaged(ctx)
 	if len(rows) != 0 {
 		t.Fatalf("staged should be dropped, got %d", len(rows))
+	}
+}
+
+// Output mode must mirror fs timestamps of the originals onto the staged
+// copies (rule 5): CopyFileBytes moves bytes only, so gather has to carry
+// the times over explicitly.
+func TestGather_OutputMode_CopiesPreserveTimes(t *testing.T) {
+	ctx := context.Background()
+	in := t.TempDir()
+	out := t.TempDir()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "image_compressor.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	orig := filepath.Join(in, "a.jpg")
+	jpeg := []byte{0xFF, 0xD8, 0xFF, 0xE0, 0, 0, 0, 0, 0xFF, 0xD9}
+	if err := os.WriteFile(orig, jpeg, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	past := time.Now().Add(-72 * time.Hour).Truncate(time.Second)
+	if err := os.Chtimes(orig, past, past); err != nil {
+		t.Fatal(err)
+	}
+
+	r := New(&config.Config{Input: in, Output: out, Yes: true}, st, tools.NewLocator())
+	paths, err := r.gather(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 1 {
+		t.Fatalf("want 1 staged copy, got %d", len(paths))
+	}
+	if paths[0] != filepath.Join(out, "a.jpg") {
+		t.Fatalf("unexpected staged path: %s", paths[0])
+	}
+	fi, err := os.Stat(paths[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fi.ModTime().Equal(past) {
+		t.Fatalf("mtime not preserved: got %v want %v", fi.ModTime(), past)
 	}
 }

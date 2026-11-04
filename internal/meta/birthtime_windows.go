@@ -10,10 +10,22 @@ import (
 // set creation time, so we call SetFileTime directly. Errors are returned but
 // callers treat them as non-fatal (best-effort nicety).
 func CopyBirthTime(src, dst string) error {
-	ct, err := getCreateTime(src)
+	ct, err := BirthTimeOf(src)
 	if err != nil {
 		return err
 	}
+	return SetBirthTime(dst, ct)
+}
+
+// BirthTimeOf reads the NTFS creation time of path (0 when unavailable).
+// Capture it BEFORE any swap that may replace src itself.
+func BirthTimeOf(path string) (int64, error) {
+	return getCreateTime(path)
+}
+
+// SetBirthTime stamps a previously captured creation time (as returned by
+// BirthTimeOf) onto dst.
+func SetBirthTime(dst string, ct int64) error {
 	if ct == 0 {
 		return nil
 	}
