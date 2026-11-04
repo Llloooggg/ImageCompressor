@@ -45,8 +45,10 @@
 
 - **`avifenc`** (статический, официальный AOMediaCodec/libavif) — **встроен**. Фото/анимация самодостаточны.
 - **`exiftool`** (exe + дерево `exiftool_files/` с Perl) — **встроен** (структура дерева обязательна!).
-- **`ffmpeg`/`ffprobe`** (видео/AV1) — по умолчанию **внешняя** (большая); ищется в `PATH`/`tools/`.
-  Полная автономность видео: положить `ffmpeg.exe`/`ffprobe.exe` в `internal/assets/tools/windows/` и пересобрать.
+- **`ffmpeg`/`ffprobe`** (видео/AV1) — **встроены** (статика gyan.dev essentials ~65 МБ zip; exe ~265 МБ).
+  В essentials **нет `libsvtav1`** — `BuildVideoChain` при отсутствии SVT (по пробену `-encoders`) честно
+  деградирует в `libaom-av1`. Для SVT-скорости: полный билд (BtbN gpl) кладётся в `tools/` у exe — внешнее
+  выигрывает у встроенного. Скачивать: ffmpeg — gyan.dev `ffmpeg-release-essentials.zip` (BITS/curl -C -).
 - Бинарники в `internal/assets/tools/windows/` **не коммитить** (gitignore), но они должны лежать на
   диске перед `go build`, иначе не встраиваются. Скачивать: avifenc — GitHub Releases AOMediaCodec/libavif
   (`windows-artifacts.zip`, статический); exiftool — SourceForge (BITS/`Start-BitsTransfer` обходит JS-заглушку;

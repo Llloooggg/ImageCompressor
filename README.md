@@ -13,23 +13,26 @@ Go сам не кодирует — он вызывает внешние бин�
 реализовано через `go:embed` + распаковку дерева в temp при запуске (аналог `sys._MEIPASS`),
 сохраняя структуру — поэтому `exiftool.exe` видит рядом `exiftool_files/` (Perl), а `avifenc.exe` самодостаточен.
 
-Уже **встроено** в `dist/mediacompressor.exe` (Windows): **`avifenc`** (статический, официальный релиз
-AOMediaCodec/libavif) и **`exiftool`** (exe + дерево `exiftool_files/`). Это делает путь **фото/анимация +
-метаданные полностью самодостаточным** — на другом ПК ничего ставить не нужно.
+Уже **встроено** в `dist/mediacompressor.exe` (Windows, ~265 МБ): **`avifenc`** (статический, официальный
+релиз AOMediaCodec/libavif), **`exiftool`** (exe + дерево `exiftool_files/`) и **`ffmpeg`/`ffprobe`**
+(статическая сборка gyan.dev essentials). ** exe полностью автономен: фото, видео и метаданные работают на
+любом Windows-ПК без установки чего-либо.**
 
 Самодостаточность обеспечивается на этапе сборки: бинарники кладутся в `internal/assets/tools/windows/`
 и **не хранятся в git** (`.gitignore`). Положить и пересобрать:
 
 ```powershell
-# avifenc (статический exe) и exiftool (exe + папка exiftool_files/) -> в дерево встраивания
-# (ffmpeg можно встроить тем же способом, см. ниже)
+# avifenc (статический exe), exiftool (exe + папка exiftool_files/) и ffmpeg.exe/ffprobe.exe
+# (статика) -> положить в internal/assets/tools/windows/, затем:
 go generate ./cmd/mediacompressor
 go build -trimpath -ldflags "-s -w" -o dist/mediacompressor.exe ./cmd/mediacompressor
 ```
 
-**ffmpeg / ffprobe** (для видео/AV1) — большая зависимость, **не вшита по умолчанию**: ищется в `PATH`
-или в `tools/` рядом с exe. Хочешь полностью автономный видео-путь — положи `ffmpeg.exe`+`ffprobe.exe`
-в `internal/assets/tools/windows/` и пересобери (exe станет ~130–150 МБ). Для фото это не нужно.
+Замечание про встроенный ffmpeg: используется gyan.dev **essentials** — там есть `libaom-av1` и GPU-AV1
+(nvenc/amf/qsv), но **нет `libsvtav1`**; цепочка видео это честно замечает и использует `libaom-av1`
+(медленнее, качество то же). Хочешь SVT-AV1 скорость — положи полный статический билд (например,
+BtbN `win64-gpl`) как `ffmpeg.exe`/`ffprobe.exe` в папку **`tools/` рядом с exe**: внешние тулзы имеют
+приоритет над встроенными, перезапускать сборку не нужно.
 
 Порядок поиска тулзы: `tools/` у exe → `bin/` у exe → каталог exe → `tools/` cwd → **встроенный (temp)** → `PATH`.
 

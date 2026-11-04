@@ -149,6 +149,8 @@ func AvailableEncoders(ctx context.Context, loc *tools.Locator) map[string]bool 
 }
 
 // BuildVideoChain resolves the try-order for a mode given encoder availability.
+// If the ffmpeg build lacks libsvtav1 (e.g. gyan essentials) but has libaom-av1,
+// the CPU slot honestly degrades to libaom instead of failing mid-run.
 func (o Opts) BuildVideoChain(avail map[string]bool) VideoChain {
 	crf := o.VideoCRF
 	svt := cand{"libsvtav1", "-crf", strconv.Itoa(clamp(crf, 1, 45))}
@@ -156,6 +158,11 @@ func (o Opts) BuildVideoChain(avail map[string]bool) VideoChain {
 	nv := cand{"av1_nvenc", "-cq", strconv.Itoa(clamp(crf, 8, 45))}
 	amf := cand{"av1_amf", "-rc cqp -qp_i -qp_p", fmt.Sprintf("%d %d", clamp(crf, 8, 45), clamp(crf, 8, 45))}
 	qsv := cand{"av1_qsv", "-global_quality", strconv.Itoa(clamp(crf, 8, 45))}
+
+	cpu := svt
+	if !avail["libsvtav1"] && avail["libaom-av1"] {
+		cpu = aom // ffmpeg build without SVT-AV1 (probed) -> honest fallback
+	}
 
 	var gpu []cand
 	for _, c := range []cand{nv, amf, qsv} {
@@ -168,7 +175,7 @@ func (o Opts) BuildVideoChain(avail map[string]bool) VideoChain {
 	case EncLibaom, "max":
 		return VideoChain{[]cand{aom}}
 	case EncCPU:
-		return VideoChain{[]cand{svt}}
+		return VideoChain{[]cand{cpu}}
 	case EncGPU:
 		return VideoChain{gpu} // may be empty -> caller reports "no GPU AV1"
 	case EncNVENC:
@@ -177,8 +184,8 @@ func (o Opts) BuildVideoChain(avail map[string]bool) VideoChain {
 		return VideoChain{[]cand{amf}}
 	case EncQSV:
 		return VideoChain{[]cand{qsv}}
-	default: // auto: GPU first, then SVT CPU
-		return VideoChain{append(gpu, svt)}
+	default: // auto: GPU first, then CPU (SVT-AV1 or libaom)
+		return VideoChain{append(gpu, cpu)}
 	}
 }
 
