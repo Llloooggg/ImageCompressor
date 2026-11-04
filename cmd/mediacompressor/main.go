@@ -82,7 +82,6 @@ func runMain(ctx context.Context, cfg *config.Config) error {
 func warnTools(loc *tools.Locator) {
 	need := map[string]string{
 		"ffmpeg":   "видео/AV1 и AVIF-fallback",
-		"ffprobe":  "уточнение подкодеков видео",
 		"exiftool": "перенос метаданных (EXIF/ICC/XMP)",
 		"avifenc":  "оптимальный AVIF для фото (иначе ffmpeg-fallback)",
 	}

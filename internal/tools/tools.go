@@ -105,9 +105,9 @@ func exeName(name string) string {
 	return name
 }
 
-// FFmpeg/FFprobe conveniences.
-func (l *Locator) FFmpeg() string  { return l.Resolve("ffmpeg") }
-func (l *Locator) FFprobe() string { return l.Resolve("ffprobe") }
+// FFmpeg and codec-helper conveniences. (ffprobe is intentionally not used:
+// ffmpeg's -map 0:a? + audio-transcode fallback cover stream probing natively.)
+func (l *Locator) FFmpeg() string   { return l.Resolve("ffmpeg") }
 func (l *Locator) Exiftool() string { return l.Resolve("exiftool") }
 func (l *Locator) Avifenc() string  { return l.Resolve("avifenc") }
 
