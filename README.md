@@ -228,5 +228,5 @@ go build -trimpath -ldflags "-s -w" -o dist/image_compressor.exe ./cmd/mediacomp
 Требования: Go, `CGO_ENABLED=0`; бинарники помощников (`avifenc`, `exiftool`, `ffmpeg`
 full_build) должны лежать в `internal/assets/tools/windows/` до сборки — они встраиваются
 в exe (где взять — в `AGENTS.md`). Кросс-сборка на Linux из Windows работает за счёт
-чистого Go (modernc.org/sqlite, без cgo). Архитектура и решения — в `PLAN.md`, правила для
-агентов — в `AGENTS.md`.
+чистого Go (modernc.org/sqlite, без cgo). Архитектура и решения — в `AGENTS.md`, там же
+правила для агентов.
