@@ -32,9 +32,6 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-const toolVersion = "0.1.0"
-const toolSelf = "mediacompressor"
-
 type Runner struct {
 	cfg         *config.Config
 	store       *store.Store
@@ -44,7 +41,6 @@ type Runner struct {
 	vsem        chan struct{}
 	vchain      media.VideoChain
 	exif        string
-	legacy      map[string]struct{}
 	processRoot string
 	hasAvifenc  bool
 	hasFFmpeg   bool
@@ -54,6 +50,11 @@ type Runner struct {
 	origBytes, newBytes, scanBytes                                      atomic.Int64
 	done                                                                atomic.Int64
 	total                                                               int
+	pruned                                                              int64 // journal rows GC'd at run end
+	gcGuarded                                                           bool  // GC refused: walk scope < half the DB
+
+	observedMu sync.Mutex          // guards observed (end-of-run journal GC)
+	observed   map[string]struct{} // every content hash this walk laid eyes on
 
 	multi     bool        // VT fixed-height status block: counters + per-worker rows
 	firstDraw atomic.Bool // first VT repaint of this run
@@ -111,6 +112,7 @@ func New(cfg *config.Config, st *store.Store, loc *tools.Locator) *Runner {
 		exif:       loc.Exiftool(),
 		hasAvifenc: loc.Avifenc() != "",
 		hasFFmpeg:  loc.FFmpeg() != "",
+		observed:   map[string]struct{}{},
 	}
 }
 
@@ -287,14 +289,6 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 	}
 
-	if r.cfg.Migrate {
-		lu, err := r.store.LegacyUnmigratedHashes(ctx)
-		if err != nil {
-			return fmt.Errorf("legacy set: %w", err)
-		}
-		r.legacy = lu
-	}
-
 	// Probe AV1 encoders once and resolve the GPU->CPU fallback chain.
 	avail := media.ProbeAV1Encoders(ctx, r.loc)
 	r.vchain = r.opts.BuildVideoChain(avail)
@@ -384,6 +378,22 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 	if err != nil {
 		return err
+	}
+	// Journal GC (the zombie sweep): a completed walk observed every hash that
+	// still exists in the tree, so rows nobody observed are records of content
+	// that is gone (deleted by hand, replaced from outside, an archive redo
+	// restoring originals). Deleting them keeps the DB a truthful mirror and
+	// makes manual pre-redo cleanup unnecessary. Never for dry-run/fix-ext
+	// (those walks don't hash media), never for --output runs, never after a
+	// stop — and PruneUnseen itself refuses if the walk saw < half the DB.
+	if !r.cfg.DryRun && !r.cfg.FixExt && r.cfg.InPlace() && ctx.Err() == nil {
+		n, guarded, gerr := r.store.PruneUnseen(context.WithoutCancel(ctx), r.observed)
+		switch {
+		case gerr != nil:
+			r.logf("journal gc: %v", gerr)
+		default:
+			r.pruned, r.gcGuarded = n, guarded
+		}
 	}
 	fmt.Println()
 	return nil
@@ -767,6 +777,8 @@ func (r *Runner) process(ctx context.Context, path string) {
 		r.logf("hash %s: %v", path, err)
 		return
 	}
+	// Journal GC witness: this content exists in the tree right now.
+	r.observe(h)
 
 	// Idempotency: decide using the recorded outcome + settings stamp.
 	rec, processed, err := r.store.IsProcessed(ctx, h)
@@ -785,13 +797,11 @@ func (r *Runner) process(ctx context.Context, path string) {
 				r.ensureHonestExt(path, res) // lying ext is fixed even for untouched files
 				return
 			}
-		default: // compressed / legacy output already on disk
-			if !r.legacyNeedsMigrate(h) {
-				r.skipDone.Add(1)
-				r.addSize(path, path)
-				r.ensureHonestExt(path, res)
-				return
-			}
+		default: // compressed: our (or an adopted old) canonical output on disk
+			r.skipDone.Add(1)
+			r.addSize(path, path)
+			r.ensureHonestExt(path, res)
+			return
 		}
 	}
 
@@ -819,14 +829,11 @@ func (r *Runner) process(ctx context.Context, path string) {
 	r.encodeSwap(ctx, path, rel, h, res, still)
 }
 
-// legacyNeedsMigrate: in --migrate mode, a legacy-python output that hasn't been
-// unified yet should be re-encoded once to the new canon.
-func (r *Runner) legacyNeedsMigrate(h string) bool {
-	if !r.cfg.Migrate {
-		return false
-	}
-	_, ok := r.legacy[h]
-	return ok
+// observe records a content hash this walk has seen (end-of-run journal GC).
+func (r *Runner) observe(h string) {
+	r.observedMu.Lock()
+	r.observed[h] = struct{}{}
+	r.observedMu.Unlock()
 }
 
 func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res detect.Result, still bool) {
@@ -922,7 +929,7 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 		safefs.RemoveIfExists(tmp)
 		r.skipNotSmaller.Add(1)
 		r.addSize(path, path)
-		_ = r.store.MarkNoChange(ctx, srcHash, rel, res.Kind.String(), mediaFormatFor(res, finalPath), toolSelf, toolVersion, r.stampFor(res.Kind))
+		_ = r.store.MarkNoChange(ctx, srcHash, rel, res.Kind.String(), r.stampFor(res.Kind))
 		r.changes.record("not smaller", rel, rel, origSize, origSize, time.Since(t0).Seconds(), res.Kind.String(), mediaFormatFor(res, finalPath), "", encNote)
 		r.ensureHonestExt(path, res)
 		return
@@ -975,7 +982,7 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 		safefs.RemoveIfExists(tmp)
 		r.skipNotSmaller.Add(1)
 		r.addSize(path, path)
-		_ = r.store.MarkNoChange(ctx, srcHash, rel, res.Kind.String(), mediaFormatFor(res, finalPath), toolSelf, toolVersion, r.stampFor(res.Kind))
+		_ = r.store.MarkNoChange(ctx, srcHash, rel, res.Kind.String(), r.stampFor(res.Kind))
 		r.changes.record("not smaller", rel, rel, origInfo.Size(), newInfo.Size(), time.Since(t0).Seconds(), res.Kind.String(), mediaFormatFor(res, finalPath), "", encNote)
 		r.ensureHonestExt(path, res)
 		return
@@ -997,15 +1004,15 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 		return
 	}
 	newRel := r.rel(finalPath)
+	// The swapped-in content now exists on disk: the walk already passed this
+	// file, so only an explicit observation keeps its row alive at GC time.
+	r.observe(newHash)
 	// Commit must land even if a stop request arrives right here: the rename
 	// already happened, so the DB record has to follow it (WithoutCancel).
-	if err := r.store.CommitSwap(context.WithoutCancel(ctx), sid, newHash, newRel, res.Kind.String(), mediaFormatFor(res, finalPath), toolSelf, toolVersion, achieved); err != nil {
+	if err := r.store.CommitSwap(context.WithoutCancel(ctx), sid, newHash, newRel, res.Kind.String(), achieved); err != nil {
 		r.errored.Add(1)
 		r.logf("commit %s: %v", rel, err)
 		return
-	}
-	if r.cfg.Migrate && r.legacyNeedsMigrate(srcHash) {
-		_ = r.store.MarkMigrated(ctx, srcHash)
 	}
 
 	// Restore NTFS creation time onto the swapped-in file (Windows; no-op elsewhere).
@@ -1103,7 +1110,7 @@ func (r *Runner) fixExtOnly(path string, res detect.Result) {
 	}
 	// update stored filename mapping for the known hash
 	if h, err := hashFile(newPath); err == nil {
-		_ = r.store.MarkCompressed(context.Background(), h, r.rel(newPath), res.Kind.String(), string(res.Format), "fix-ext", toolVersion, "")
+		_ = r.store.MarkCompressed(context.Background(), h, r.rel(newPath), res.Kind.String(), "")
 	}
 	r.processed.Add(1)
 	r.addSize(path, newPath)
@@ -1114,7 +1121,7 @@ func (r *Runner) finalize(ctx context.Context, sid int64, finalPath, expectedHas
 	if err != nil {
 		return r.store.DropStaged(ctx, sid)
 	}
-	return r.store.CommitSwap(ctx, sid, expectedHash, r.rel(finalPath), res.Kind.String(), mediaFormatFor(res, finalPath), toolSelf, toolVersion, "")
+	return r.store.CommitSwap(ctx, sid, expectedHash, r.rel(finalPath), res.Kind.String(), "")
 }
 
 func (r *Runner) rel(p string) string {
@@ -1153,12 +1160,21 @@ func (r *Runner) Summary() string {
 	if ob > 0 {
 		pct = (1 - nb/ob) * 100
 	}
-	return fmt.Sprintf(
+	out := fmt.Sprintf(
 		"Done. Compressed: %d, already processed: %d, not smaller: %d, extensions fixed: %d, non-media: %d, errors: %d\n"+
 			"Size: %.2f MB -> %.2f MB = %.2f%% saved",
 		r.processed.Load(), r.skipDone.Load(), r.skipNotSmaller.Load(), r.fixedExt.Load(), r.skipUnknown.Load(), r.errored.Load(),
 		ob, nb, pct,
 	)
+	switch {
+	case r.gcGuarded:
+		// GC refused: this walk saw less than half of what the DB knows
+		// (subfolder run against a shared --db). Nothing was deleted; say so.
+		out += "\nJournal pruned: 0 (skipped: the walk saw under half of the DB — running over a subfolder with a shared --db?)"
+	case r.pruned > 0:
+		out += fmt.Sprintf("\nJournal pruned: %d stale entries", r.pruned)
+	}
+	return out
 }
 
 func chainString(v media.VideoChain) string {

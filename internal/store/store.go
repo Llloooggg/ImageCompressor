@@ -10,8 +10,10 @@
 //     operation (encode -> fsync -> journal BEGIN -> atomic rename -> DB COMMIT).
 //     If the process dies at any point, Recover() finishes or undoes the swap.
 //
-// It also adopts the legacy Python image_compressor.db (table processed_images
-// with hash+filename) on first run and adds its own columns non-destructively.
+// An older database (even the Python-era one, table processed_images with just
+// hash+filename) is adopted as-is: our columns are added non-destructively.
+// A completed walk ends with the journal GC (PruneUnseen), which deletes rows
+// for content that no longer exists anywhere in the archive.
 package store
 
 import (
@@ -36,21 +38,14 @@ const (
 	OutcomeNoChange   = "nochange"   // evaluated; could not shrink -> original kept
 )
 
-// Tool identifies who produced a stored hash.
-const ToolLegacy = "legacy-python"
-
 // Record is a processed file entry returned by IsProcessed.
 type Record struct {
 	Hash     string
-	Filename string // legacy: "|" joined relative paths
-	Media    string
-	Format   string
-	Tool     string
-	Version  string
-	Migrated int
-	Outcome  string // compressed | nochange | "" (legacy unknown)
+	Filename string // "|"-joined relative paths seen for this content
+	Media    string // image | video | animated (NOT derivable from the ext: avif is both photo and animated)
+	Outcome  string // compressed | nochange
 	Stamp    string // settings fingerprint for nochange decisions
-	Achieved string // actual result quality ("crf=34 vmaf=96.4", "q=85"); "" = unknown
+	Achieved string // actual result quality ("svt p8 crf=34 vmaf=96.4", "avifenc s6 q=85"); "" = unknown
 }
 
 // StagedRow is an in-flight swap that a crash may have interrupted.
@@ -123,15 +118,11 @@ func (s *Store) migrate(ctx context.Context) error {
 		return err
 	}
 	want := map[string]string{
-		"media_kind":   "TEXT",
-		"format":       "TEXT",
-		"tool":         "TEXT",
-		"tool_version": "TEXT",
-		"migrated":     "INTEGER DEFAULT 0",
-		"updated_at":   "TEXT",
-		"outcome":      "TEXT",
-		"stamp":        "TEXT",
-		"achieved":     "TEXT", // actual result quality: "crf=34 vmaf=96.4" / "q=85" (feeds future re-compression)
+		"media_kind": "TEXT",
+		"updated_at": "TEXT",
+		"outcome":    "TEXT",
+		"stamp":      "TEXT",
+		"achieved":   "TEXT", // actual result quality: "svt p8 crf=34 vmaf=96.4" / "avifenc s6 q=85"
 	}
 	for col, typ := range want {
 		if !have[col] {
@@ -141,10 +132,10 @@ func (s *Store) migrate(ctx context.Context) error {
 			}
 		}
 	}
-	// Rows that predate our tool are Python outputs; tag them so --migrate can
-	// find them and so we never mistake them for our own canonical output.
-	_, _ = s.db.ExecContext(ctx,
-		"UPDATE processed_images SET tool = ? WHERE tool IS NULL OR tool = ''", ToolLegacy)
+	// The old columns (tool/tool_version/migrated/format) are gone from the
+	// schema and from every query. If an existing DB still has them (pre-
+	// cleanup), they simply stay untouched and unused: the one-off DB prep
+	// script drops them; the code never references them either way.
 	return nil
 }
 
@@ -172,59 +163,16 @@ func (s *Store) columns(ctx context.Context, table string) (map[string]bool, err
 	return out, rows.Err()
 }
 
-// ProcessedSet returns every recorded content hash (seed set for idempotency).
-func (s *Store) ProcessedSet(ctx context.Context) (map[string]struct{}, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rows, err := s.db.QueryContext(ctx, "SELECT hash FROM processed_images")
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	set := map[string]struct{}{}
-	for rows.Next() {
-		var h string
-		if err := rows.Scan(&h); err != nil {
-			return nil, err
-		}
-		set[h] = struct{}{}
-	}
-	return set, rows.Err()
-}
-
-// LegacyUnmigratedHashes returns hashes produced by the old Python tool that
-// --migrate has not yet unified into the new canonical format.
-func (s *Store) LegacyUnmigratedHashes(ctx context.Context) (map[string]struct{}, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rows, err := s.db.QueryContext(ctx,
-		"SELECT hash FROM processed_images WHERE tool = ? AND IFNULL(migrated,0) = 0", ToolLegacy)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	set := map[string]struct{}{}
-	for rows.Next() {
-		var h string
-		if err := rows.Scan(&h); err != nil {
-			return nil, err
-		}
-		set[h] = struct{}{}
-	}
-	return set, rows.Err()
-}
-
 // IsProcessed returns the record for a content hash, if any.
 func (s *Store) IsProcessed(ctx context.Context, hash string) (Record, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var r Record
 	err := s.db.QueryRowContext(ctx, `
-		SELECT hash, IFNULL(filename,''), IFNULL(media_kind,''), IFNULL(format,''),
-		       IFNULL(tool,''), IFNULL(tool_version,''), IFNULL(migrated,0),
+		SELECT hash, IFNULL(filename,''), IFNULL(media_kind,''),
 		       IFNULL(outcome,''), IFNULL(stamp,''), IFNULL(achieved,'')
 		FROM processed_images WHERE hash = ? LIMIT 1`, hash).Scan(
-		&r.Hash, &r.Filename, &r.Media, &r.Format, &r.Tool, &r.Version, &r.Migrated, &r.Outcome, &r.Stamp, &r.Achieved)
+		&r.Hash, &r.Filename, &r.Media, &r.Outcome, &r.Stamp, &r.Achieved)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Record{}, false, nil
 	}
@@ -237,27 +185,84 @@ func (s *Store) IsProcessed(ctx context.Context, hash string) (Record, bool, err
 // shouldMergePaths: markProcessed/MarkNoChange upsert and merge the "|" filename list.
 
 // MarkCompressed records a hash we produced (canonical output on disk).
-// achieved carries the actual result quality ("crf=34 vmaf=96.4", "q=85").
-func (s *Store) MarkCompressed(ctx context.Context, hash, relPath, media, format, tool, version, achieved string) error {
+// achieved carries the actual result quality ("svt p8 crf=34 vmaf=96.4").
+func (s *Store) MarkCompressed(ctx context.Context, hash, relPath, media, achieved string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.upsert(ctx, s.db, hash, relPath, media, format, tool, version, OutcomeCompressed, "", achieved)
+	return s.upsert(ctx, s.db, hash, relPath, media, OutcomeCompressed, "", achieved)
 }
 
 // MarkNoChange records that a source hash was evaluated but could not be shrunk
 // under `stamp` settings, so future runs with the SAME stamp can skip it cheaply.
-func (s *Store) MarkNoChange(ctx context.Context, hash, relPath, media, format, tool, version, stamp string) error {
+func (s *Store) MarkNoChange(ctx context.Context, hash, relPath, media, stamp string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.upsert(ctx, s.db, hash, relPath, media, format, tool, version, OutcomeNoChange, stamp, "")
+	return s.upsert(ctx, s.db, hash, relPath, media, OutcomeNoChange, stamp, "")
 }
 
-// MarkMigrated flips migrated=1 for a hash (used by --migrate, runs once).
-func (s *Store) MarkMigrated(ctx context.Context, hash string) error {
+// PruneUnseen deletes journal rows for content that a COMPLETED walk never
+// observed. Those rows are history of files that no longer exist (externally
+// deleted, replaced, renamed by other means, or an archive redo that restored
+// originals over our outputs). Keeping them only bloats the DB and pollutes
+// audits. This runs only after a full, successful, in-place (non-dry-run,
+// non-stopped) walk.
+//
+// Safety guard: if `seen` contains fewer than half the hashes the DB already
+// knows, we are almost certainly walking a SUBFOLDER against a shared --db,
+// and pruning would eat records of files that simply weren't in scope. In that
+// case we delete nothing and report guarded=true so the caller can warn.
+func (s *Store) PruneUnseen(ctx context.Context, seen map[string]struct{}) (deleted int64, guarded bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.ExecContext(ctx, "UPDATE processed_images SET migrated = 1 WHERE hash = ?", hash)
-	return err
+
+	var total int64
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM processed_images`).Scan(&total); err != nil {
+		return 0, false, err
+	}
+	if total == 0 {
+		return 0, false, nil
+	}
+	// Too few rows observed -> partial walk against a shared DB: refuse.
+	if int64(len(seen))*2 < total {
+		return 0, true, nil
+	}
+
+	// NOT IN (large list) is the expensive part; do it in SQL with a temp table
+	// rather than string-building placeholders, and stay inside one tx so a
+	// concurrent writer (single-writer anyway) can't slip in.
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, false, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE _seen(hash TEXT PRIMARY KEY)`); err != nil {
+		return 0, false, err
+	}
+	stmt, err := tx.PrepareContext(ctx, `INSERT INTO _seen(hash) VALUES(?)`)
+	if err != nil {
+		return 0, false, err
+	}
+	defer stmt.Close()
+	for h := range seen {
+		if _, err := stmt.ExecContext(ctx, h); err != nil {
+			return 0, false, err
+		}
+	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM processed_images WHERE hash NOT IN (SELECT hash FROM _seen)`)
+	if err != nil {
+		return 0, false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, false, err
+	}
+	if _, err := tx.ExecContext(ctx, `DROP TABLE _seen`); err != nil {
+		return 0, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, false, err
+	}
+	return n, false, nil
 }
 
 // BeginSwap journals an intended atomic replace BEFORE the rename happens.
@@ -275,7 +280,7 @@ func (s *Store) BeginSwap(ctx context.Context, sourceHash, expectedHash, finalPa
 
 // CommitSwap finalizes the swap: records the new hash as processed and removes
 // the staged row in one transaction.
-func (s *Store) CommitSwap(ctx context.Context, stagedID int64, newHash, relPath, media, format, tool, version, achieved string) error {
+func (s *Store) CommitSwap(ctx context.Context, stagedID int64, newHash, relPath, media, achieved string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -283,7 +288,7 @@ func (s *Store) CommitSwap(ctx context.Context, stagedID int64, newHash, relPath
 		return err
 	}
 	defer tx.Rollback()
-	if err := s.upsert(ctx, tx, newHash, relPath, media, format, tool, version, OutcomeCompressed, "", achieved); err != nil {
+	if err := s.upsert(ctx, tx, newHash, relPath, media, OutcomeCompressed, "", achieved); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, "DELETE FROM staged WHERE id = ?", stagedID); err != nil {
@@ -294,7 +299,7 @@ func (s *Store) CommitSwap(ctx context.Context, stagedID int64, newHash, relPath
 
 // upsert inserts/updates a processed row, merging the "|" filename list. It
 // works both on the DB and inside a transaction (both satisfy execer).
-func (s *Store) upsert(ctx context.Context, ex execer, hash, relPath, media, format, tool, version, outcome, stamp, achieved string) error {
+func (s *Store) upsert(ctx context.Context, ex execer, hash, relPath, media, outcome, stamp, achieved string) error {
 	var existing sql.NullString
 	err := ex.QueryRowContext(ctx, "SELECT filename FROM processed_images WHERE hash = ?", hash).Scan(&existing)
 	merged := relPath
@@ -311,19 +316,16 @@ func (s *Store) upsert(ctx context.Context, ex execer, hash, relPath, media, for
 		return err
 	}
 	_, err = ex.ExecContext(ctx, `
-		INSERT INTO processed_images(hash, filename, media_kind, format, tool, tool_version, outcome, stamp, achieved, updated_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?)
+		INSERT INTO processed_images(hash, filename, media_kind, outcome, stamp, achieved, updated_at)
+		VALUES(?,?,?,?,?,?,?)
 		ON CONFLICT(hash) DO UPDATE SET
 			filename=excluded.filename,
 			media_kind=COALESCE(NULLIF(excluded.media_kind,''), processed_images.media_kind),
-			format=COALESCE(NULLIF(excluded.format,''), processed_images.format),
-			tool=excluded.tool,
-			tool_version=excluded.tool_version,
 			outcome=excluded.outcome,
 			stamp=excluded.stamp,
 			achieved=COALESCE(NULLIF(excluded.achieved,''), processed_images.achieved),
 			updated_at=excluded.updated_at`,
-		hash, merged, media, format, tool, version, outcome, stamp, achieved, time.Now().UTC().Format(time.RFC3339))
+		hash, merged, media, outcome, stamp, achieved, time.Now().UTC().Format(time.RFC3339))
 	return err
 }
 

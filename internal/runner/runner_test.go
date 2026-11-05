@@ -187,7 +187,7 @@ func TestProcess_NoChange_LyingExt_StillRenamed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := st.MarkNoChange(ctx, h, "liar.dat", "image", "avif", toolSelf, toolVersion, r.stampFor(detect.KindImage)); err != nil {
+	if err := st.MarkNoChange(ctx, h, "liar.dat", "image", r.stampFor(detect.KindImage)); err != nil {
 		t.Fatal(err)
 	}
 

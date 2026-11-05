@@ -115,7 +115,7 @@
 - Идиоматичный Go: `context.Context` на всех долгих операциях и внешних процессах;
   параллелим `errgroup.SetLimit(workers)`; ошибки оборачивать `fmt.Errorf("...: %w", err)`;
   `database/sql` + `modernc.org/sqlite`.
-- Конфиг/флаги: `--input --output --migrate --gpu --max --photo-q --photo-vmaf-min
+- Конфиг/флаги: `--input --output --gpu --max --photo-q --photo-vmaf-min
   --photo-speed --photo-lossless --video-crf --video-vmaf-min --video-workers --video-preset
   --workers --no-still --fix-ext --dry-run --yes`.
   **Дефолты таковы, что exe без аргументов сжимает
@@ -175,15 +175,26 @@
   шляп), `internal/vt` (ANSI-режим консоли), `internal/runner`,
   `internal/config`, `cmd/mediacompressor`.
 - Старая Python-реализация удалена из дерева (осталась только в git-истории). Её SQLite
-  `image_compressor.db` **живёт в архиве пользователя** — это миграционный вход для Go.
+  `image_compressor.db` **живёт в архиве пользователя** — Go принимает её как есть
+  (таблица `processed_images(hash, filename)`, колонки добавляет `ALTER`-ями).
 
-## Миграция старой БД (важно)
+## Журнал БД и GC зомби-записей
 
-- Go открывает **тот же** `image_compressor.db`, таблица `processed_images(hash, filename)`.
-  `internal/store` бесследно добавляет колонки (`tool/migrated/format/media_kind/...`) через `ALTER`,
-  старые строки = `tool='legacy-python'`, и сеется хэшами → не ре-компрессит вывод Python.
-- `--migrate` = одноразовое «лего»: приводит legacy-выходы к новому канону ровно раз
-  (`WHERE tool='legacy-python' AND migrated=0`), ставит `migrated=1`. Можно выпилить позже.
+- Схема журнала (после выпиливания легаси): `hash, filename, media_kind, outcome, stamp,
+  achieved, updated_at` + отдельная таблица `staged` (крах-журнал свапа, живёт секунды).
+  Колонок `tool/tool_version/migrated/format` в коде больше нет; в живой БД их сносит
+  **одноразовая ручная операция** (helper вне репо: DELETE legacy-строк → DROP COLUMN ×4 →
+  VACUUM), код работает и с колонками, и без них.
+- `--migrate` и вся легаси-поддержка ВЫПИЛЕНЫ: перепись живой БД доказала, что
+  python-контента на диске не осталось (752 «немигрированных» строки — зомби, у
+  622 уже есть пара `mediacompressor/compressed`).
+- **GC зомби (канон)**: обход наблюдает хэш каждого медиа-файла (`r.observe` + явное
+  наблюдение `newHash` после свапа); в конце ПОЛНОГО успешного прогона (не dry-run,
+  не fix-ext, не --output, не остановка) `PruneUnseen` удаляет строки ненаблюдённого
+  содержимого. Барьер: наблюденных меньше половины строк БД → зачистка пропускается
+  (признак подпапки с общей `--db`), в сводке — `Journal pruned: N` или предупреждение.
+  Бонус: ручная чистка БД перед редо архива больше не нужна — осиротевшие строки
+  уезжают сами первым же прогоном.
 
 ## Чего НЕ делать
 

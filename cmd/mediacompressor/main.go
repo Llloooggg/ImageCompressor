@@ -57,10 +57,6 @@ func main() {
 }
 
 func runMain(ctx context.Context, cfg *config.Config) error {
-	if cfg.Migrate && !cfg.InPlace() {
-		return fmt.Errorf("--migrate only works in-place, without --output")
-	}
-
 	loc := tools.NewLocator()
 	defer assets.Cleanup()
 	warnTools(loc)

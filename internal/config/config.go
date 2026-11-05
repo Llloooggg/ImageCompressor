@@ -26,7 +26,6 @@ type Config struct {
 	VideoWorkers int  // concurrent heavy video encodes (lane count); 0 = auto
 	VideoPreset  int  // SVT-AV1 preset 2..12 (0 = codec default); higher = faster, bigger
 	Still        bool // collapse still-image videos (one static frame + soundtrack) into a photo; default on
-	Migrate      bool // one-shot unify of legacy-python outputs
 	FixExt       bool // ONLY fix lying extensions (no compression); extensions are also always fixed during normal runs
 	DryRun       bool
 	Yes          bool // skip confirmation
@@ -84,7 +83,6 @@ func Parse(args []string) (*Config, error) {
 	fs.BoolVar(&gpu, "gpu", false, "hardware AV1 only, mode gpu")
 	fs.BoolVar(&cpu, "cpu", false, "SVT-AV1 CPU only, mode cpu")
 	fs.BoolVar(&max, "max", false, "smallest output via libaom-av1, slow, mode libaom")
-	fs.BoolVar(&c.Migrate, "migrate", false, "one-shot: convert legacy-python outputs to the new canon; keep the flag until it reports nothing left to migrate")
 	fs.BoolVar(&c.FixExt, "fix-ext", false, "separate mode: only fix lying extensions, no compression; normal mode always fixes them too")
 	fs.BoolVar(&c.DryRun, "dry-run", false, "show what would happen without touching files")
 	fs.BoolVar(&c.Yes, "yes", false, "skip the confirmation prompt, for automation")
