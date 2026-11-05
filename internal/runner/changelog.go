@@ -68,6 +68,19 @@ func (c *changeLog) record(action, src, dst string, srcSize, dstSize int64, secs
 
 func mbOf(n int64) float64 { return float64(n) / (1024 * 1024) }
 
+// summary writes the end-of-run console summary as one log line (newlines
+// flattened), so the run's verdict survives even if the console window gets
+// closed before it can be read.
+func (c *changeLog) summary(text string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	fmt.Fprintf(c.w, "%s\tsummary\t%s\n", time.Now().Format("2006-01-02 15:04:05"), flat(text))
+	_ = c.w.Flush()
+}
+
 func (c *changeLog) close() {
 	if c == nil {
 		return

@@ -395,6 +395,9 @@ func (r *Runner) Run(ctx context.Context) error {
 			r.pruned, r.gcGuarded = n, guarded
 		}
 	}
+	// The same summary the console shows, as one journal line: if the console
+	// window gets closed (double-click UX), the run's verdict is still on disk.
+	r.changes.summary(r.Summary())
 	fmt.Println()
 	return nil
 }

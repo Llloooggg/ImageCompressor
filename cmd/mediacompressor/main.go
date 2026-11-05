@@ -134,6 +134,9 @@ func confirm(ctx context.Context) bool {
 	fmt.Println("\nWarning: files will be modified in place. Continue? [y/N]: ")
 	reader := bufio.NewReader(os.Stdin)
 	line, err := reader.ReadString('\n')
+	// Drop any leftover keystrokes queued during the prompt so they can't be
+	// mistaken for the end-of-run pause's Enter later.
+	flushStdin()
 	if ctx.Err() != nil {
 		return false
 	}
@@ -145,6 +148,11 @@ func confirm(ctx context.Context) bool {
 
 func pauseIfInteractive() {
 	if isTerminal(os.Stdin) {
+		// Any Enter/keys typed DURING the (possibly multi-hour) run sit unread
+		// in the console buffer. Flush first, then demand a fresh Enter: this
+		// guarantees the double-clicked window stays open until the user has
+		// actually read the summary, instead of closing on a stray keystroke.
+		flushStdin()
 		fmt.Println("\nPress Enter to exit...")
 		bufio.NewReader(os.Stdin).ReadString('\n')
 	}
