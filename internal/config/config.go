@@ -23,6 +23,7 @@ type Config struct {
 	VideoVMAF  float64 // min VMAF for escalated CRF levels (0 disables the quality guard)
 	VideoEnc   string  // auto|gpu|cpu|nvenc|amf|qsv|libaom (see media)
 	Workers    int
+	Still      bool // collapse still-image videos (one static frame + soundtrack) into a photo; default on
 	Migrate    bool // one-shot unify of legacy-python outputs
 	FixExt     bool // ONLY fix lying extensions (no compression); extensions are also always fixed during normal runs
 	DryRun     bool
@@ -72,6 +73,8 @@ func Parse(args []string) (*Config, error) {
 	fs.IntVar(&c.VideoCRF, "video-crf", 28, "base AV1 CRF 0..50, lower = better/heavier; the tool raises it by +6/+12 steps when it cannot shrink")
 	fs.Float64Var(&c.VideoVMAF, "video-vmaf-min", 95, "min VMAF for raised CRF steps, vs original (0 = disable quality guard)")
 	fs.IntVar(&c.Workers, "workers", defWorkers, fmt.Sprintf("parallel workers (default %d)", defWorkers))
+	var noStill bool
+	fs.BoolVar(&noStill, "no-still", false, "keep still-image videos, one static frame with a soundtrack glued on, as videos; by default such files collapse into one photo frame and the soundtrack is dropped")
 	fs.StringVar(&c.VideoEnc, "video-encoder", "auto", "video encoders: auto|gpu|cpu|nvenc|amf|qsv|libaom (auto = GPU first, CPU fallback)")
 	var gpu, cpu, max bool
 	fs.BoolVar(&gpu, "gpu", false, "hardware AV1 only, mode gpu")
@@ -96,6 +99,7 @@ func Parse(args []string) (*Config, error) {
 	case cpu:
 		c.VideoEnc = "cpu"
 	}
+	c.Still = !noStill
 	if c.VideoEnc == "" {
 		c.VideoEnc = "auto"
 	}

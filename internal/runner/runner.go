@@ -98,7 +98,7 @@ func childBudget(workers int) int {
 func (r *Runner) stampFor(k detect.Kind) string {
 	switch k {
 	case detect.KindVideo:
-		return fmt.Sprintf("vid|%d|%.0f|%s|ff=%v", r.opts.VideoCRF, r.opts.VideoVMAFMin, r.opts.Encoder, r.hasFFmpeg)
+		return fmt.Sprintf("vid|%d|%.0f|%s|ff=%v|still=%v", r.opts.VideoCRF, r.opts.VideoVMAFMin, r.opts.Encoder, r.hasFFmpeg, r.cfg.Still)
 	case detect.KindAnimated:
 		return fmt.Sprintf("anim|%d|%v|avifenc=%v|ff=%v", r.opts.PhotoQ, r.opts.PhotoLoss, r.hasAvifenc, r.hasFFmpeg)
 	default:
@@ -192,6 +192,11 @@ func (r *Runner) Run(ctx context.Context) error {
 	avail := media.ProbeAV1Encoders(ctx, r.loc)
 	r.vchain = r.opts.BuildVideoChain(avail)
 	fmt.Printf("Video encoders, mode %q: %s\n", r.opts.Encoder, chainString(r.vchain))
+	if r.cfg.Still {
+		fmt.Println("Still-image video collapse: on, one static frame with a soundtrack becomes a photo, use --no-still to keep such files as videos")
+	} else {
+		fmt.Println("Still-image video collapse: off, hat-shaped videos stay normal videos")
+	}
 
 	files, err := r.gather(ctx)
 	if err != nil {
@@ -470,15 +475,28 @@ func (r *Runner) process(ctx context.Context, path string) {
 		}
 	}
 
+	// "Hat" detection: a social-media video that is really one static frame
+	// with a soundtrack glued on collapses into a photo (see media.
+	// StillVideo). Runs after idempotency checks so processed/skipped files
+	// never pay for probing; both witnesses must agree before we collapse.
+	still := res.Kind == detect.KindVideo && r.cfg.Still && r.hasFFmpeg &&
+		media.StillVideo(ctx, r.loc, path)
+
 	rel := r.rel(path)
 
 	// Dry run: just report what would change.
 	if r.cfg.DryRun {
-		fmt.Printf("[dry-run] %s -> %s\n", rel, filepath.Base(r.finalPath(path, res)))
+		target := filepath.Base(r.finalPath(path, res))
+		note := ""
+		if still {
+			target = replaceExt(target, detect.FmtAVIF.HonestExt())
+			note = ", collapse still-image video to photo"
+		}
+		fmt.Printf("[dry-run] %s -> %s%s\n", rel, target, note)
 		return
 	}
 
-	r.encodeSwap(ctx, path, rel, h, res)
+	r.encodeSwap(ctx, path, rel, h, res, still)
 }
 
 // legacyNeedsMigrate: in --migrate mode, a legacy-python output that hasn't been
@@ -491,7 +509,15 @@ func (r *Runner) legacyNeedsMigrate(h string) bool {
 	return ok
 }
 
-func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res detect.Result) {
+func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res detect.Result, still bool) {
+	if still {
+		// The file collapses video -> photo: everything downstream (target
+		// extension, DB kind/format, achieved string, journal) follows the
+		// image branch. The original file on disk is still the MP4 at this
+		// point; media.CollapseStill extracts the frame itself.
+		res.Kind = detect.KindImage
+		res.Format = detect.FmtAVIF
+	}
 	finalPath := r.finalPath(path, res) // honest extension target
 	// NTFS creation time must be captured BEFORE the swap: when finalPath ==
 	// path (same-name replace, e.g. mp4->mp4) the original is gone by the
@@ -513,7 +539,11 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 	}
 	switch res.Kind {
 	case detect.KindImage:
-		pinfo, encErr = media.EncodeImage(ctx, r.loc, r.opts, path, tmp, origSize)
+		if still {
+			pinfo, encErr = media.CollapseStill(ctx, r.loc, r.opts, path, tmp, origSize)
+		} else {
+			pinfo, encErr = media.EncodeImage(ctx, r.loc, r.opts, path, tmp, origSize)
+		}
 	case detect.KindAnimated:
 		encErr = media.EncodeAnimated(ctx, r.loc, r.opts, path, tmp)
 	case detect.KindVideo:
@@ -528,6 +558,9 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 		return
 	}
 	achieved := r.achievedFor(res.Kind, vinfo, pinfo)
+	if still {
+		achieved = "still " + achieved // audit: this "photo" was once a video hat
+	}
 	if errors.Is(encErr, media.ErrNotSmaller) {
 		safefs.RemoveIfExists(tmp)
 		r.skipNotSmaller.Add(1)
@@ -633,7 +666,11 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 	if origInfo != nil {
 		srcSize = origInfo.Size()
 	}
-	r.changes.record("compressed", rel, newRel, srcSize, dstSize, res.Kind.String(), mediaFormatFor(res, finalPath), achieved, "")
+	action := "compressed"
+	if still {
+		action = "still collapsed" // was a video hat: one frame kept, soundtrack dropped
+	}
+	r.changes.record(action, rel, newRel, srcSize, dstSize, res.Kind.String(), mediaFormatFor(res, finalPath), achieved, "")
 	if finalPath != path {
 		safefs.RemoveIfExists(path)
 	}
