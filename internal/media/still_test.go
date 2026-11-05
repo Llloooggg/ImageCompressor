@@ -289,7 +289,7 @@ func TestCollapseStillEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	tmp := filepath.Join(dir, "out.avif")
-	res, err := CollapseStill(context.Background(), loc, Opts{PhotoQ: 85, PhotoSpeed: 6}, hat, tmp, origSize.Size())
+	res, err := CollapseStill(context.Background(), loc, Opts{PhotoQ: 85, PhotoSpeed: 6}, hat, tmp, origSize.Size(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

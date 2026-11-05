@@ -163,12 +163,22 @@ func PhotoLadder(base int) []int {
 // for a point that is BOTH smaller AND imperceptible. No such point -> the
 // file is left untouched (ErrNotSmaller): we never trade visible quality for
 // size. Lossless mode has no ladder (quality is fixed by definition).
-func EncodeImage(ctx context.Context, loc *tools.Locator, o Opts, src, tmp string, origSize int64) (PhotoResult, error) {
+// progress (optional, may be nil) receives the ladder label (q85, q79, ...)
+// before each attempt so the live status slot shows the photo step too
+// (display consistency with video; a still frame has no timeline position).
+func EncodeImage(ctx context.Context, loc *tools.Locator, o Opts, src, tmp string, origSize int64, progress func(label string)) (PhotoResult, error) {
 	attempts := []string{} // encode/VMAF audit log: "<tool> q85 kept 0.4s"
 	record := func(what string, d time.Duration) {
 		attempts = append(attempts, fmt.Sprintf("%s %.1fs", what, d.Seconds()))
 	}
 	attempt := func(q int) (kept, ran bool, lastErr error, win string) {
+		if progress != nil {
+			if o.PhotoLoss {
+				progress("lossless")
+			} else {
+				progress(fmt.Sprintf("q%d", q))
+			}
+		}
 		t0 := time.Now()
 		tool, err := encodeImageAt(ctx, loc, o, q, src, tmp)
 		if err != nil {
@@ -310,7 +320,19 @@ func encodeImageFFmpeg(ctx context.Context, loc *tools.Locator, o Opts, q int, s
 
 // EncodeAnimated GIF/animated WebP -> animated AVIF. tmp must end in .avif.
 // Tries avifenc first (best animated AVIF; reads GIF natively), then ffmpeg.
-func EncodeAnimated(ctx context.Context, loc *tools.Locator, o Opts, src, tmp string) error {
+// Returns the short name of the encoder that actually produced the file
+// (audit canon: who won is recorded like quality is). progress (optional)
+// gets the quality label being attempted before the run: a big gif is a
+// full multi-frame AV1 encode, the one photo-class job that can take
+// minutes, so the runner runs it on a heavy lane and wants it in the slot.
+func EncodeAnimated(ctx context.Context, loc *tools.Locator, o Opts, src, tmp string, progress func(label string)) (string, error) {
+	if progress != nil {
+		if o.PhotoLoss {
+			progress("lossless")
+		} else {
+			progress(fmt.Sprintf("q%d", clamp(o.PhotoQ, 0, 100)))
+		}
+	}
 	if a := loc.Avifenc(); a != "" {
 		args := []string{"--speed", strconv.Itoa(clamp(o.PhotoSpeed, 0, 10))}
 		if o.PhotoLoss {
@@ -324,14 +346,14 @@ func EncodeAnimated(ctx context.Context, loc *tools.Locator, o Opts, src, tmp st
 		args = append(args, src, tmp)
 		if err := run(loc, a, args...); err == nil {
 			if st, serr := os.Stat(tmp); serr == nil && st.Size() > 0 {
-				return nil
+				return "avifenc", nil
 			}
 		}
 		// fall back to ffmpeg below
 	}
 	ff := loc.FFmpeg()
 	if ff == "" {
-		return fmt.Errorf("no encoder for animated AVIF (avifenc failed and ffmpeg not found)")
+		return "", fmt.Errorf("no encoder for animated AVIF (avifenc failed and ffmpeg not found)")
 	}
 	args := []string{
 		"-y", "-i", src,
@@ -345,9 +367,9 @@ func EncodeAnimated(ctx context.Context, loc *tools.Locator, o Opts, src, tmp st
 	}
 	args = append(args, tmp)
 	if err := run(loc, ff, args...); err != nil {
-		return fmt.Errorf("animated AVIF failed (avifenc + ffmpeg tried): %w", err)
+		return "", fmt.Errorf("animated AVIF failed (avifenc + ffmpeg tried): %w", err)
 	}
-	return nil
+	return "aom", nil
 }
 
 // ---- video: GPU-first with CPU fallback ----

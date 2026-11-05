@@ -185,6 +185,14 @@ func TestStatusSlotProgress(t *testing.T) {
 	if !strings.Contains(lines[1], want+`  family\nina.avi`) {
 		t.Errorf("over-1h position must fit the column: %q", lines[1])
 	}
+	// photo/animated: current ladder step, label only (no timeline to place)
+	r4 := &Runner{multi: true, processRoot: `C:\arc`, cfg: &config.Config{Workers: 1}}
+	r4.trackStart(`C:\arc\family\photo.jpg`)
+	r4.trackProgress(`family\photo.jpg`, "q85", 0)
+	lines = r4.statusBlock("hdr", 200)
+	if !strings.Contains(lines[1], "q85") || strings.Contains(lines[1], "/") {
+		t.Errorf("photo slot must show the ladder step without a position: %q", lines[1])
+	}
 }
 
 func TestAchievedForEncoders(t *testing.T) {
@@ -207,6 +215,27 @@ func TestAchievedForEncoders(t *testing.T) {
 	if got := r.achievedFor(detect.KindImage, media.VideoResult{}, media.PhotoResult{Q: 85, VMAF: -1, Codec: "avifenc"}); got != "avifenc q=85" {
 		t.Errorf("photo achieved: %q", got)
 	}
+	// photo speed rides along for avifenc winners, symmetric with the SVT
+	// preset marker: "was this pushed at s6 or s4" decides re-runs
+	rs := &Runner{opts: media.Opts{PhotoQ: 85, PhotoSpeed: 6}}
+	if got := rs.achievedFor(detect.KindImage, media.VideoResult{}, media.PhotoResult{Q: 85, VMAF: -1, Codec: "avifenc"}); got != "avifenc s6 q=85" {
+		t.Errorf("photo achieved must carry speed: %q", got)
+	}
+	// lossless must not pretend to sit on the q scale
+	rl := &Runner{opts: media.Opts{PhotoQ: 85, PhotoSpeed: 6, PhotoLoss: true}}
+	if got := rl.achievedFor(detect.KindImage, media.VideoResult{}, media.PhotoResult{Q: 85, VMAF: -1, Codec: "avifenc"}); got != "avifenc lossless" {
+		t.Errorf("lossless photo achieved: %q", got)
+	}
+	// animated: winner encoder + speed + q (EncodeAnimated now reports who won)
+	if got := rs.achievedFor(detect.KindAnimated, media.VideoResult{}, media.PhotoResult{Codec: "avifenc"}); got != "avifenc s6 q=85" {
+		t.Errorf("animated achieved: %q", got)
+	}
+	if got := rs.achievedFor(detect.KindAnimated, media.VideoResult{}, media.PhotoResult{Codec: "aom"}); got != "aom s6 q=85" {
+		t.Errorf("animated ffmpeg fallback must record the winner: %q", got)
+	}
+	if got := rl.achievedFor(detect.KindAnimated, media.VideoResult{}, media.PhotoResult{Codec: "avifenc"}); got != "avifenc lossless" {
+		t.Errorf("lossless animated achieved: %q", got)
+	}
 }
 
 func TestVideoLanesClamp(t *testing.T) {
@@ -228,10 +257,10 @@ func TestVideoLanesClamp(t *testing.T) {
 
 func TestVideosLast(t *testing.T) {
 	in := []string{
-		`a\clip.MP4`, `a\photo.jpg`, `a\movie.mkv`, `a\notes.txt`, `a\clip.webm`, `a\pic.jpeg`,
+		`a\clip.MP4`, `a\photo.jpg`, `a\movie.mkv`, `a\notes.txt`, `a\clip.webm`, `a\pic.jpeg`, `a\dance.gif`,
 	}
 	got := videosLast(in)
-	want := []string{`a\photo.jpg`, `a\notes.txt`, `a\pic.jpeg`, `a\clip.MP4`, `a\movie.mkv`, `a\clip.webm`}
+	want := []string{`a\photo.jpg`, `a\notes.txt`, `a\pic.jpeg`, `a\clip.MP4`, `a\movie.mkv`, `a\clip.webm`, `a\dance.gif`}
 	for i := range want {
 		if got[i] != want[i] {
 			t.Errorf("videosLast = %v, want %v", got, want)

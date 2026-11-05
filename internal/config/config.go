@@ -75,7 +75,7 @@ func Parse(args []string) (*Config, error) {
 	fs.IntVar(&c.VideoCRF, "video-crf", 28, "base AV1 CRF 0..50, lower = better/heavier; the tool raises it by +6/+12 steps when it cannot shrink")
 	fs.Float64Var(&c.VideoVMAF, "video-vmaf-min", 95, "min VMAF for raised CRF steps, vs original (0 = disable quality guard)")
 	fs.IntVar(&c.Workers, "workers", defWorkers, fmt.Sprintf("parallel workers (default %d)", defWorkers))
-	fs.IntVar(&c.VideoWorkers, "video-workers", 0, "videos encoded side by side; each gets cores/video-workers threads (default auto: cores/8, so one SVT-AV1 can actually unfold)")
+	fs.IntVar(&c.VideoWorkers, "video-workers", 0, "heavy encodes (video/animated) running side by side; each gets cores/lanes threads (default auto: cores/8, so one SVT-AV1 can actually unfold)")
 	fs.IntVar(&c.VideoPreset, "video-preset", 8, "SVT-AV1 preset 2..12: lower = smarter/smaller/slower, 8 = balanced default; only affects CPU SVT")
 	var noStill bool
 	fs.BoolVar(&noStill, "no-still", false, "keep still-image videos, one static frame with a soundtrack glued on, as videos; by default such files collapse into one photo frame and the soundtrack is dropped")

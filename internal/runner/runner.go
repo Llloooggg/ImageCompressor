@@ -144,6 +144,21 @@ func videoLanes(cfg *config.Config) int {
 	return lanes
 }
 
+// acquireLane takes one heavy-encode lane (video AND animated: multi-frame
+// AV1 jobs starve on a thin thread slice, the battle proved it) and shows
+// "queued" in the slot while waiting. false = stop requested.
+func (r *Runner) acquireLane(ctx context.Context, rel string) bool {
+	if r.multi {
+		r.trackProgress(rel, "queued", 0)
+	}
+	select {
+	case r.vsem <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
 // childBudget = cores per worker (floor 1): the auto-computed slice of the
 // machine granted to each parallel encoder job.
 func childBudget(workers int) int {
@@ -157,11 +172,12 @@ func childBudget(workers int) int {
 	return t
 }
 
-// videoSchedExts are file extensions treated as heavy video for QUEUEING
+// videoSchedExts are file extensions treated as heavy encodes for QUEUEING
 // only (videosLast). This never decides what a file IS: classification and
 // honest extensions remain magic-bytes-only (canon).
 var videoSchedExts = map[string]bool{
 	".mp4": true, ".mov": true, ".mkv": true, ".webm": true, ".avi": true, ".m4v": true,
+	".gif": true, // animated: a multi-frame AV1 encode, queued with the heavy jobs
 }
 
 // videosLast stably moves extension-video files to the back of the queue:
@@ -191,9 +207,9 @@ func (r *Runner) stampFor(k detect.Kind) string {
 	case detect.KindVideo:
 		return fmt.Sprintf("vid|%d|%.0f|%s|preset=%d|ff=%v|still=%v", r.opts.VideoCRF, r.opts.VideoVMAFMin, r.opts.Encoder, r.opts.VideoPreset, r.hasFFmpeg, r.cfg.Still)
 	case detect.KindAnimated:
-		return fmt.Sprintf("anim|%d|%v|avifenc=%v|ff=%v", r.opts.PhotoQ, r.opts.PhotoLoss, r.hasAvifenc, r.hasFFmpeg)
+		return fmt.Sprintf("anim|%d|%v|speed=%d|avifenc=%v|ff=%v", r.opts.PhotoQ, r.opts.PhotoLoss, r.opts.PhotoSpeed, r.hasAvifenc, r.hasFFmpeg)
 	default:
-		return fmt.Sprintf("img|%d|%.0f|%v|avifenc=%v|ff=%v", r.opts.PhotoQ, r.opts.PhotoVMAFMin, r.opts.PhotoLoss, r.hasAvifenc, r.hasFFmpeg)
+		return fmt.Sprintf("img|%d|%.0f|%v|speed=%d|avifenc=%v|ff=%v", r.opts.PhotoQ, r.opts.PhotoVMAFMin, r.opts.PhotoLoss, r.opts.PhotoSpeed, r.hasAvifenc, r.hasFFmpeg)
 	}
 }
 
@@ -283,7 +299,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	avail := media.ProbeAV1Encoders(ctx, r.loc)
 	r.vchain = r.opts.BuildVideoChain(avail)
 	fmt.Printf("Video encoders, mode %q: %s\n", r.opts.Encoder, chainString(r.vchain))
-	fmt.Printf("Video lanes: %d side by side, %d threads each\n", cap(r.vsem), r.videoOpts.CPUBudget)
+	fmt.Printf("Heavy encodes (video/animated): %d lanes side by side, %d threads each\n", cap(r.vsem), r.videoOpts.CPUBudget)
 	if r.cfg.Still {
 		fmt.Println("Still-image video collapse: on, one static frame with a soundtrack becomes a photo, use --no-still to keep such files as videos")
 	} else {
@@ -477,6 +493,9 @@ func slotPos(j activeJob) string {
 	}
 	if j.stage == "queued" {
 		return "queued"
+	}
+	if j.curMs <= 0 && j.durMs <= 0 {
+		return j.stage // photo/animated ladder step (q85, lossless): no timeline
 	}
 	cur := fmtDurShort(time.Duration(j.curMs) * time.Millisecond)
 	if j.durMs <= 0 {
@@ -839,36 +858,43 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 	if oi, err := os.Stat(path); err == nil {
 		origSize = oi.Size()
 	}
+	// Photo/animated ladder step labels feed the same status slot column the
+	// video position lives in: the display is consistent across kinds, only
+	// the content differs (a still frame has no timeline to show position on).
+	var pprog func(label string)
+	if r.multi {
+		pprog = func(label string) { r.trackProgress(rel, label, 0) }
+	}
 	switch res.Kind {
 	case detect.KindImage:
 		if still {
-			pinfo, encErr = media.CollapseStill(ctx, r.loc, r.opts, path, tmp, origSize)
+			pinfo, encErr = media.CollapseStill(ctx, r.loc, r.opts, path, tmp, origSize, pprog)
 		} else {
-			pinfo, encErr = media.EncodeImage(ctx, r.loc, r.opts, path, tmp, origSize)
+			pinfo, encErr = media.EncodeImage(ctx, r.loc, r.opts, path, tmp, origSize, pprog)
 		}
 	case detect.KindAnimated:
-		encErr = media.EncodeAnimated(ctx, r.loc, r.opts, path, tmp)
+		// Animated GIF/WebP is a real multi-frame AV1 encode: a big gif can
+		// burn minutes on a thin -j2 slice, exactly the video starvation.
+		// So it runs on a heavy lane with the fat budget, shows "queued"
+		// while waiting, and records which encoder actually won.
+		if r.acquireLane(ctx, rel) {
+			pinfo.Codec, encErr = media.EncodeAnimated(ctx, r.loc, r.videoOpts, path, tmp, pprog)
+			<-r.vsem
+		} else {
+			encErr = ctx.Err() // stop request while queued: not an error (checked below)
+		}
 	case detect.KindVideo:
 		// Heavy AV1 passes run a few files at a time on the video lanes
 		// (each lane child gets cores/lanes threads, so SVT-AV1 unfolds);
 		// the wait for a lane is visible in the slot as "queued". The
 		// duration header probe (no decode, no ffprobe per canon) lets the
 		// slot show position/total for the running pass.
-		var durMs int64 = -1
 		if r.multi {
-			durMs = media.InspectDuration(ctx, r.loc, path)
-			if durMs >= 0 {
-				r.trackTotal(rel, durMs)
+			if dur := media.InspectDuration(ctx, r.loc, path); dur >= 0 {
+				r.trackTotal(rel, dur)
 			}
-			r.trackProgress(rel, "queued", 0)
 		}
-		acquired := false
-		select {
-		case r.vsem <- struct{}{}:
-			acquired = true
-		case <-ctx.Done():
-		}
-		if acquired {
+		if r.acquireLane(ctx, rel) {
 			var prog func(label string, curMs int64)
 			if r.multi {
 				prog = func(label string, curMs int64) { r.trackProgress(rel, label, curMs) }
@@ -1276,11 +1302,12 @@ func (r *Runner) printBreak(print func()) {
 // achievedFor renders the actual result quality stored in the DB ("achieved"
 // column) — for future runs it answers "at what quality does this file already
 // sit, is there room to squeeze further?". It leads with the encoder that won
-// and how it was driven ("svt p8 crf=34 vmaf=96.4", "avifenc q=85"): encoder
-// choice is audit data like quality is, and the scales are not comparable
-// across encoders. The SVT preset rides along (it changes size/quality, so
-// "was this file pushed at 8 or at 6?" decides whether re-running is worth
-// it); other encoders ignore --video-preset, so it only appears for svt.
+// and how it was driven ("svt p8 crf=34 vmaf=96.4", "avifenc s6 q=85"):
+// encoder choice is audit data like quality is, and the scales are not
+// comparable across encoders. The SVT preset and the avifenc speed ride along
+// (both change size/quality, so "pushed at 8 or at 6 / at s6 or s4" decides
+// whether re-running is worth it; speed only appears for the tool that uses
+// it). Lossless outputs say "lossless" — the q number there would lie.
 // 10-bit is canon-on for every AV1 output — invariant, not recorded.
 func (r *Runner) achievedFor(k detect.Kind, v media.VideoResult, p media.PhotoResult) string {
 	head := ""
@@ -1306,15 +1333,27 @@ func (r *Runner) achievedFor(k detect.Kind, v media.VideoResult, p media.PhotoRe
 		if p.Codec != "" {
 			head = p.Codec + " "
 		}
+		if r.opts.PhotoLoss {
+			return head + "lossless" // q-scale is meaningless there
+		}
+		if r.opts.PhotoSpeed > 0 {
+			head += fmt.Sprintf("s%d ", r.opts.PhotoSpeed) // avifenc speed: the photo twin of the SVT preset marker
+		}
 		if p.VMAF >= 0 {
 			return fmt.Sprintf("%sq=%d vmaf=%.1f", head, p.Q, p.VMAF)
 		}
 		return fmt.Sprintf("%sq=%d", head, p.Q)
 	case detect.KindAnimated:
-		if r.opts.PhotoLoss {
-			return "lossless"
+		if p.Codec != "" {
+			head = p.Codec + " "
 		}
-		return fmt.Sprintf("q=%d", r.opts.PhotoQ)
+		if r.opts.PhotoLoss {
+			return head + "lossless"
+		}
+		if r.opts.PhotoSpeed > 0 {
+			head += fmt.Sprintf("s%d ", r.opts.PhotoSpeed)
+		}
+		return fmt.Sprintf("%sq=%d", head, r.opts.PhotoQ)
 	default:
 		return ""
 	}

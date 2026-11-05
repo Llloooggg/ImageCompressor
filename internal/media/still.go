@@ -81,7 +81,8 @@ func StillVideo(ctx context.Context, loc *tools.Locator, src string) bool {
 // (ladder/guard semantics included; the base level almost always wins since
 // it is compared against the VIDEO size). The soundtrack is deliberately
 // discarded. tmp must end in .avif; the original is never touched.
-func CollapseStill(ctx context.Context, loc *tools.Locator, o Opts, src, tmp string, origSize int64) (PhotoResult, error) {
+// progress (optional) forwards the photo ladder labels to the live status.
+func CollapseStill(ctx context.Context, loc *tools.Locator, o Opts, src, tmp string, origSize int64, progress func(label string)) (PhotoResult, error) {
 	ff := loc.FFmpeg()
 	if ff == "" {
 		return PhotoResult{}, errors.New("no ffmpeg to extract a frame from video")
@@ -112,7 +113,7 @@ func CollapseStill(ctx context.Context, loc *tools.Locator, o Opts, src, tmp str
 	if st, serr := os.Stat(png); serr != nil || st.Size() == 0 {
 		return PhotoResult{}, errors.New("extract still frame: no frame produced")
 	}
-	res, err := EncodeImage(ctx, loc, o, png, tmp, origSize)
+	res, err := EncodeImage(ctx, loc, o, png, tmp, origSize, progress)
 	return res, err
 }
 
