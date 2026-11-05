@@ -87,13 +87,13 @@ winget install Microsoft.HEIFImageExtension
 
 ```
 [0:23:11] 19000/46415 (41%)  ok:14000 already:3000 nofit:1500 ext:20 err:3  |  saved 2450 MB  |  ETA 3:12:00
- 1     45s  kolya\VID_20260501_120334.mp4
- 2      3s  sveta\dsc_0412.jpg
- 3   1840s  nina\Video 2020-11-05 14-44-56_join_001_join_002_join_003.avi
- 4      1s  hat\music_photo.mp4
- 5      7s  pasha\IMG_2021.jpg
+ 1      45s  kolya\VID_20260501_120334.mp4
+ 2       3s  sveta\dsc_0412.jpg
+ 3    30:40  nina\Video 2020-11-05 14-44-56_join_001_join_002_join_003.avi
+ 4       1s  hat\music_photo.mp4
+ 5       7s  pasha\IMG_2021.jpg
 ...
-12      --
+12        --
 ```
 
 Ошибки в консоль живым блоком не пишутся вовсе: растёт только счётчик `err`, а

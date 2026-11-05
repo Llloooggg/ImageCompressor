@@ -80,6 +80,27 @@ func TestPrintStatusFixedBlock(t *testing.T) {
 	}
 }
 
+func TestFmtDurShort(t *testing.T) {
+	cases := []struct {
+		d    time.Duration
+		want string
+	}{
+		{0, "0s"},
+		{7 * time.Second, "7s"},
+		{59 * time.Second, "59s"},
+		{60 * time.Second, "1:00"},
+		{1200*time.Second + 30*time.Second, "20:30"},
+		{3599 * time.Second, "59:59"},
+		{3600 * time.Second, "1:00:00"},
+		{5422 * time.Second, "1:30:22"}, // the nina 5.2 GB AVI case: was "5422s"
+	}
+	for _, c := range cases {
+		if got := fmtDurShort(c.d); got != c.want {
+			t.Errorf("fmtDurShort(%v) = %q, want %q", c.d, got, c.want)
+		}
+	}
+}
+
 func TestStatusBlockSlots(t *testing.T) {
 	r := &Runner{multi: true, processRoot: `C:\arc`, cfg: &config.Config{}}
 	r.cfg.Workers = 2

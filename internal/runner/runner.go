@@ -379,12 +379,29 @@ func (r *Runner) statusBlock(header string, maxw int) []string {
 	for i := 0; i < workers; i++ {
 		if i < len(jobs) {
 			j := jobs[i]
-			lines = append(lines, clip(fmt.Sprintf("%2d  %5ds  %s", i+1, int(now.Sub(j.start).Seconds()), j.rel), clipw))
+			lines = append(lines, clip(fmt.Sprintf("%2d  %8s  %s", i+1, fmtDurShort(now.Sub(j.start)), j.rel), clipw))
 		} else {
-			lines = append(lines, fmt.Sprintf("%2d  %5s", i+1, "--"))
+			lines = append(lines, fmt.Sprintf("%2d  %8s", i+1, "--"))
 		}
 	}
 	return lines
+}
+
+// fmtDurShort renders an in-flight elapsed time compactly: "45s" under a
+// minute, mm:ss with a padded first digit up to an hour (the battle complaint:
+// "1840s" is unreadable), h:mm:ss beyond. Right-align with %8s in the block.
+func fmtDurShort(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	s := int(d.Seconds())
+	if s < 60 {
+		return fmt.Sprintf("%ds", s)
+	}
+	if s < 3600 {
+		return fmt.Sprintf("%d:%02d", s/60, s%60)
+	}
+	return fmt.Sprintf("%d:%02d:%02d", s/3600, (s%3600)/60, s%60)
 }
 
 // blockLines is the fixed row count of the live block for the current worker
