@@ -18,13 +18,14 @@ func TestBuildVideoChain(t *testing.T) {
 		avail map[string]bool
 		want  []string
 	}{
-		{"auto full", EncAuto, full, []string{"av1_nvenc", "av1_amf", "av1_qsv", "libsvtav1"}},
-		{"auto no svt falls back to libaom", EncAuto, noSvt, []string{"av1_nvenc", "libaom-av1"}},
+		{"auto is cpu-only canon", EncAuto, full, []string{"libsvtav1"}},
+		{"auto no svt falls back to libaom", EncAuto, noSvt, []string{"libaom-av1"}},
 		{"auto essentials no gpu", EncAuto, noGpuNoSvt, []string{"libaom-av1"}},
 		{"auto probe failed keeps svt", EncAuto, map[string]bool{}, []string{"libsvtav1"}},
 		{"cpu svt", EncCPU, full, []string{"libsvtav1"}},
 		{"cpu no svt falls back to libaom", EncCPU, noSvt, []string{"libaom-av1"}},
 		{"max always libaom", "max", full, []string{"libaom-av1"}},
+		{"gpu orders nvenc amf qsv", EncGPU, full, []string{"av1_nvenc", "av1_amf", "av1_qsv"}},
 		{"gpu only", EncGPU, noGpuNoSvt, []string{}},
 	}
 	for _, tt := range tests {
@@ -38,6 +39,24 @@ func TestBuildVideoChain(t *testing.T) {
 				t.Fatalf("chain = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestCodecShort(t *testing.T) {
+	cases := map[string]string{
+		"libsvtav1":  "svt",
+		"libaom-av1": "aom",
+		"av1_nvenc":  "nvenc",
+		"av1_amf":    "amf",
+		"av1_qsv":    "qsv",
+		"ffmpeg":     "aom",
+		"avifenc":    "avifenc",
+		"weird":      "weird",
+	}
+	for in, want := range cases {
+		if got := codecShort(in); got != want {
+			t.Errorf("codecShort(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
 

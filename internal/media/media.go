@@ -23,7 +23,7 @@ var ErrNotSmaller = errors.New("no encoder reduced the size")
 
 // Encoder modes.
 const (
-	EncAuto   = "auto"   // default: GPU if available, else CPU (SVT-AV1)
+	EncAuto   = "auto"   // default: CPU (SVT-AV1); GPU only when asked (--gpu)
 	EncGPU    = "gpu"    // GPU only (error if none)
 	EncCPU    = "cpu"    // SVT-AV1 only
 	EncNVENC  = "nvenc"  // force av1_nvenc
@@ -47,10 +47,37 @@ type Opts struct {
 // PhotoResult reports what EncodeImage actually achieved when it kept a temp:
 // the effective q of the winning encode (after ladder + guard) and the measured
 // VMAF against the original (-1 = never measured). The runner stores it so
-// future runs know at which quality the photo already sits.
+// future runs know at which quality the photo already sits. Codec names the
+// encoder that won (short form), Attempts is the full audit of every encode
+// (and VMAF pass) the ladder ran for this file, with durations — it lands in
+// the journal Comment column so "why did this file take so long" is answerable
+// after the fact without a verbose rerun.
 type PhotoResult struct {
-	Q    int
-	VMAF float64
+	Q        int
+	VMAF     float64
+	Codec    string
+	Attempts []string
+}
+
+// codecShort maps an encoder's full name to the compact token used in the
+// achieved string and journal ("svt crf=34", "avifenc q=85").
+func codecShort(name string) string {
+	switch name {
+	case "libsvtav1":
+		return "svt"
+	case "libaom-av1":
+		return "aom"
+	case "av1_nvenc":
+		return "nvenc"
+	case "av1_amf":
+		return "amf"
+	case "av1_qsv":
+		return "qsv"
+	case "ffmpeg":
+		return "aom"
+	default:
+		return name
+	}
 }
 
 // PhotoLadder returns the per-file q levels tried within one run: base,
@@ -83,41 +110,53 @@ func PhotoLadder(base int) []int {
 // file is left untouched (ErrNotSmaller): we never trade visible quality for
 // size. Lossless mode has no ladder (quality is fixed by definition).
 func EncodeImage(ctx context.Context, loc *tools.Locator, o Opts, src, tmp string, origSize int64) (PhotoResult, error) {
-	attempt := func(q int) (kept, ran bool, lastErr error) {
-		if err := encodeImageAt(ctx, loc, o, q, src, tmp); err != nil {
-			return false, false, err
+	attempts := []string{} // encode/VMAF audit log: "<tool> q85 kept 0.4s"
+	record := func(what string, d time.Duration) {
+		attempts = append(attempts, fmt.Sprintf("%s %.1fs", what, d.Seconds()))
+	}
+	attempt := func(q int) (kept, ran bool, lastErr error, win string) {
+		t0 := time.Now()
+		tool, err := encodeImageAt(ctx, loc, o, q, src, tmp)
+		if err != nil {
+			record(fmt.Sprintf("%s q%d fail", codecShort(tool), q), time.Since(t0))
+			return false, false, err, ""
 		}
 		ran = true // encoder produced a file successfully
 		if st, serr := os.Stat(tmp); serr == nil && st.Size() < origSize {
-			return true, true, nil // real win: keep tmp
+			record(fmt.Sprintf("%s q%d kept", codecShort(tool), q), time.Since(t0))
+			return true, true, nil, tool // real win: keep tmp
 		}
+		record(fmt.Sprintf("%s q%d nofit", codecShort(tool), q), time.Since(t0))
 		os.Remove(tmp) // ran fine but no reduction
-		return false, ran, nil
+		return false, ran, nil, ""
 	}
 	score := func() float64 {
 		ff := loc.FFmpeg()
 		if ff == "" {
 			return -1 // no ffmpeg for the metric: honest fallback (do not block)
 		}
-		return vmafScore(ctx, loc, ff, tmp, src, o.CPUBudget)
+		t0 := time.Now()
+		s := vmafScore(ctx, loc, ff, tmp, src, o.CPUBudget)
+		record(fmt.Sprintf("vmaf=%.1f guard", s), time.Since(t0))
+		return s
 	}
 
 	if o.PhotoLoss {
-		kept, ran, err := attempt(o.PhotoQ)
+		kept, ran, err, win := attempt(o.PhotoQ)
 		if kept {
-			return PhotoResult{Q: o.PhotoQ, VMAF: -1}, nil
+			return PhotoResult{Q: o.PhotoQ, VMAF: -1, Codec: codecShort(win)}, nil
 		}
 		if !ran && err != nil {
-			return PhotoResult{}, err
+			return PhotoResult{Attempts: attempts}, err
 		}
-		return PhotoResult{}, ErrNotSmaller
+		return PhotoResult{Attempts: attempts}, ErrNotSmaller
 	}
 
 	ladder := PhotoLadder(o.PhotoQ)
 	anyRan := false
 	var lastErr error
 	for i, lvl := range ladder {
-		kept, ran, err := attempt(lvl)
+		kept, ran, err, win := attempt(lvl)
 		anyRan = anyRan || ran
 		if err != nil {
 			lastErr = err
@@ -126,10 +165,10 @@ func EncodeImage(ctx context.Context, loc *tools.Locator, o Opts, src, tmp strin
 			continue
 		}
 		if i == 0 || o.PhotoVMAFMin <= 0 {
-			return PhotoResult{Q: lvl, VMAF: -1}, nil // base level: user's order; or guard disabled
+			return PhotoResult{Q: lvl, VMAF: -1, Codec: codecShort(win)}, nil // base level: user's order; or guard disabled
 		}
 		if s := score(); s < 0 || s >= o.PhotoVMAFMin {
-			return PhotoResult{Q: lvl, VMAF: s}, nil // passed the floor (no metric -> honest fallback)
+			return PhotoResult{Q: lvl, VMAF: s, Codec: codecShort(win)}, nil // passed the floor (no metric -> honest fallback)
 		}
 		// Smaller but visibly worse: bisect between this q (small, visible)
 		// and the previous higher q (invisible, but it did not shrink).
@@ -140,7 +179,7 @@ func EncodeImage(ctx context.Context, loc *tools.Locator, o Opts, src, tmp strin
 			if mid <= lo || mid >= hi {
 				break
 			}
-			k2, ran2, e2 := attempt(mid)
+			k2, ran2, e2, win2 := attempt(mid)
 			anyRan = anyRan || ran2
 			if e2 != nil {
 				lastErr = e2
@@ -150,27 +189,29 @@ func EncodeImage(ctx context.Context, loc *tools.Locator, o Opts, src, tmp strin
 				continue
 			}
 			if s2 := score(); s2 < 0 || s2 >= o.PhotoVMAFMin {
-				return PhotoResult{Q: mid, VMAF: s2}, nil // both smaller and imperceptible
+				return PhotoResult{Q: mid, VMAF: s2, Codec: codecShort(win2)}, nil // both smaller and imperceptible
 			}
 			os.Remove(tmp)
 			lo = mid // smaller but visible: pull quality back up
 		}
 		// No point in the band was both smaller AND imperceptible -> leave
 		// the file alone; deeper levels only trade more quality.
-		return PhotoResult{}, ErrNotSmaller
+		return PhotoResult{Attempts: attempts}, ErrNotSmaller
 	}
 	if anyRan {
-		return PhotoResult{}, ErrNotSmaller
+		return PhotoResult{Attempts: attempts}, ErrNotSmaller
 	}
 	if lastErr != nil {
-		return PhotoResult{}, lastErr
+		return PhotoResult{Attempts: attempts}, lastErr
 	}
-	return PhotoResult{}, ErrNotSmaller
+	return PhotoResult{Attempts: attempts}, ErrNotSmaller
 }
 
 // encodeImageAt encodes one still at quality q (0..100), avifenc first then
-// ffmpeg. Same tool-quirk handling as the old single-shot EncodeImage.
-func encodeImageAt(ctx context.Context, loc *tools.Locator, o Opts, q int, src, tmp string) error {
+// ffmpeg. Returns the tool that actually produced the file ("avifenc", or
+// "aom" for the ffmpeg libaom-av1 fallback) so the caller can record who won.
+// Same tool-quirk handling as the old single-shot EncodeImage.
+func encodeImageAt(ctx context.Context, loc *tools.Locator, o Opts, q int, src, tmp string) (string, error) {
 	if a := loc.Avifenc(); a != "" {
 		args := []string{"--speed", strconv.Itoa(clamp(o.PhotoSpeed, 0, 10))}
 		if o.PhotoLoss {
@@ -184,12 +225,13 @@ func encodeImageAt(ctx context.Context, loc *tools.Locator, o Opts, q int, src, 
 		args = append(args, src, tmp)
 		if err := run(loc, a, args...); err == nil {
 			if st, serr := os.Stat(tmp); serr == nil && st.Size() > 0 {
-				return nil
+				return "avifenc", nil
 			}
 		}
 		os.Remove(tmp) // partial output from the failed attempt
 	}
-	return encodeImageFFmpeg(ctx, loc, o, q, src, tmp)
+	err := encodeImageFFmpeg(ctx, loc, o, q, src, tmp)
+	return "aom", err
 }
 
 // encodeImageFFmpeg is the fallback: decodes any image via ffmpeg and muxes AVIF.
@@ -397,18 +439,27 @@ func (o Opts) buildChain(avail map[string]bool) VideoChain {
 		return VideoChain{cands: []cand{amf}}
 	case EncQSV:
 		return VideoChain{cands: []cand{qsv}}
-	default: // auto: GPU first, then CPU (SVT-AV1 or libaom)
-		return VideoChain{cands: append(gpu, cpu)}
+	default: // auto: CPU only (SVT-AV1, degrading to libaom). Battle-proven
+		// canon: GPU-first silently trades archive size AND quality (crf
+		// scales differ per encoder, base level is never VMAF-verified), and
+		// a GPU "not smaller" verdict still bills a full CPU pass later.
+		// Hardware encoders are opt-in: --gpu/--nvenc/--amf/--qsv.
+		return VideoChain{cands: []cand{cpu}}
 	}
 }
 
 // VideoResult reports what EncodeVideo actually achieved when it kept a temp:
 // the effective CRF of the winning encode (after ladder + bisection) and the
 // measured VMAF against the original (-1 = never measured). The runner stores
-// it so future runs know at which quality the file already sits.
+// it so future runs know at which quality the file already sits. Codec names
+// the encoder that won (short form: "svt"/"aom"/"nvenc"); Attempts is the
+// audit of every encode + VMAF pass the ladder ran for this file (the file's
+// time is the sum of these lines — the journal keeps them).
 type VideoResult struct {
-	CRF  int
-	VMAF float64
+	CRF      int
+	VMAF     float64
+	Codec    string
+	Attempts []string
 }
 
 // EncodeVideo tries the encoder chain across the CRF ladder (see CRFLadder):
@@ -436,21 +487,30 @@ func EncodeVideo(ctx context.Context, loc *tools.Locator, o Opts, chain VideoCha
 		return VideoResult{}, fmt.Errorf("no usable AV1 encoder for mode %q", o.Encoder)
 	}
 
-	attempt := func(ch VideoChain, audioArgs []string, normalize bool) (kept, ran bool, lastErr error) {
+	attempts := []string{} // encode/VMAF audit log: "<codec> crf34 kept 1350.4s"
+	record := func(what string, d time.Duration) {
+		attempts = append(attempts, fmt.Sprintf("%s %.1fs", what, d.Seconds()))
+	}
+
+	attempt := func(ch VideoChain, audioArgs []string, normalize bool, label string) (kept, ran bool, lastErr error, win string) {
 		for _, c := range ch.cands {
 			args := videoFFArgs(c, audioArgs, o.CPUBudget, normalize, src, tmp)
+			t0 := time.Now()
 			if err := run(loc, ff, args...); err != nil {
 				lastErr = fmt.Errorf("%s: %w", c.codec, err)
 				os.Remove(tmp)
+				record(fmt.Sprintf("%s %s fail", codecShort(c.codec), label), time.Since(t0))
 				continue
 			}
 			ran = true // encoder produced a file successfully
 			if st, serr := os.Stat(tmp); serr == nil && st.Size() < origSize {
-				return true, true, nil // real win: keep tmp
+				record(fmt.Sprintf("%s %s kept", codecShort(c.codec), label), time.Since(t0))
+				return true, true, nil, c.codec // real win: keep tmp
 			}
+			record(fmt.Sprintf("%s %s nofit", codecShort(c.codec), label), time.Since(t0))
 			os.Remove(tmp) // ran fine but no reduction: try next candidate
 		}
-		return false, ran, lastErr
+		return false, ran, lastErr, ""
 	}
 
 	ladder := CRFLadder(chain.crf)
@@ -459,14 +519,16 @@ func EncodeVideo(ctx context.Context, loc *tools.Locator, o Opts, chain VideoCha
 	// VMAF guard + bisection to escalated winners (see function doc).
 	runLadder := func(audioArgs []string, normalize bool) (kept bool, info VideoResult, anyRan bool, lastErr error) {
 		for i, lvl := range ladder {
-			kept, ran, err := attempt(chain.WithCRF(lvl), audioArgs, normalize)
+			kept, ran, err, win := attempt(chain.WithCRF(lvl), audioArgs, normalize, fmt.Sprintf("crf%d", lvl))
 			if kept {
 				if i == 0 || o.VideoVMAFMin <= 0 {
-					return true, VideoResult{CRF: lvl, VMAF: -1}, true, nil // base level: user's order; or guard disabled
+					return true, VideoResult{CRF: lvl, VMAF: -1, Codec: codecShort(win)}, true, nil // base level: user's order; or guard disabled
 				}
+				t0 := time.Now()
 				score := vmafScore(ctx, loc, ff, tmp, src, o.CPUBudget)
+				record(fmt.Sprintf("vmaf=%.1f guard", score), time.Since(t0))
 				if score < 0 || score >= o.VideoVMAFMin {
-					return true, VideoResult{CRF: lvl, VMAF: score}, true, nil // passed the floor (libvmaf missing -> honest fallback)
+					return true, VideoResult{CRF: lvl, VMAF: score, Codec: codecShort(win)}, true, nil // passed the floor (libvmaf missing -> honest fallback)
 				}
 				// Smaller but visibly worse: bisection in the band between the
 				// last level that could NOT shrink and this level that lost VMAF.
@@ -477,7 +539,7 @@ func EncodeVideo(ctx context.Context, loc *tools.Locator, o Opts, chain VideoCha
 					if mid <= lo || mid >= hi {
 						break
 					}
-					k2, ran2, e2 := attempt(chain.WithCRF(mid), audioArgs, normalize)
+					k2, ran2, e2, win2 := attempt(chain.WithCRF(mid), audioArgs, normalize, fmt.Sprintf("crf%d", mid))
 					anyRan = anyRan || ran2
 					if e2 != nil {
 						lastErr = e2
@@ -486,9 +548,11 @@ func EncodeVideo(ctx context.Context, loc *tools.Locator, o Opts, chain VideoCha
 						lo = mid // still not smaller: push crf up
 						continue
 					}
+					t1 := time.Now()
 					s2 := vmafScore(ctx, loc, ff, tmp, src, o.CPUBudget)
+					record(fmt.Sprintf("vmaf=%.1f probe", s2), time.Since(t1))
 					if s2 < 0 || s2 >= o.VideoVMAFMin {
-						return true, VideoResult{CRF: mid, VMAF: s2}, true, nil // both smaller and imperceptible
+						return true, VideoResult{CRF: mid, VMAF: s2, Codec: codecShort(win2)}, true, nil // both smaller and imperceptible
 					}
 					os.Remove(tmp)
 					hi = mid // smaller but visible: pull crf back
@@ -508,22 +572,24 @@ func EncodeVideo(ctx context.Context, loc *tools.Locator, o Opts, chain VideoCha
 	// Pass 1: lossless audio copy across the ladder.
 	kept, info, anyRan, lastErr := runLadder([]string{"-c:a", "copy"}, false)
 	if kept {
+		info.Attempts = attempts
 		return info, nil
 	}
 	if anyRan {
 		// Encoders worked (audio copy is fine) but nothing shrank enough
 		// honestly (or the guard refused a visible trade) -> honest outcome.
-		return VideoResult{}, ErrNotSmaller
+		return VideoResult{Attempts: attempts}, ErrNotSmaller
 	}
 
 	// Pass 2: audio copy failed for every encoder on every level ->
 	// container/audio incompatible. Transcode audio to AAC across the ladder.
 	kept, info, anyRan, lastErr = runLadder([]string{"-c:a", "aac", "-b:a", "192k"}, false)
 	if kept {
+		info.Attempts = attempts
 		return info, nil
 	}
 	if anyRan {
-		return VideoResult{}, ErrNotSmaller
+		return VideoResult{Attempts: attempts}, ErrNotSmaller
 	}
 
 	// Pass 3: no encoder would even START (0 frames produced): exotic color
@@ -532,22 +598,24 @@ func EncodeVideo(ctx context.Context, loc *tools.Locator, o Opts, chain VideoCha
 	// only help files that would otherwise error out.
 	kept, info, anyRan, err3 := runLadder([]string{"-c:a", "copy"}, true)
 	if kept {
+		info.Attempts = attempts
 		return info, nil
 	}
 	if anyRan {
-		return VideoResult{}, ErrNotSmaller
+		return VideoResult{Attempts: attempts}, ErrNotSmaller
 	}
 	kept, info, _, lastErr = runLadder([]string{"-c:a", "aac", "-b:a", "192k"}, true)
 	if kept {
+		info.Attempts = attempts
 		return info, nil
 	}
 	if lastErr != nil {
-		return VideoResult{}, lastErr
+		return VideoResult{Attempts: attempts}, lastErr
 	}
 	if err3 != nil {
-		return VideoResult{}, err3
+		return VideoResult{Attempts: attempts}, err3
 	}
-	return VideoResult{}, ErrNotSmaller
+	return VideoResult{Attempts: attempts}, ErrNotSmaller
 }
 
 // vmafScore scores candidate against the original file (reference) with

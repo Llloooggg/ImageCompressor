@@ -730,12 +730,13 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 	if still {
 		achieved = "still " + achieved // audit: this "photo" was once a video hat
 	}
+	encNote := attemptsComment(vinfo, pinfo) // per-attempt audit -> journal Comment
 	if errors.Is(encErr, media.ErrNotSmaller) {
 		safefs.RemoveIfExists(tmp)
 		r.skipNotSmaller.Add(1)
 		r.addSize(path, path)
 		_ = r.store.MarkNoChange(ctx, srcHash, rel, res.Kind.String(), mediaFormatFor(res, finalPath), toolSelf, toolVersion, r.stampFor(res.Kind))
-		r.changes.record("not smaller", rel, rel, origSize, origSize, time.Since(t0).Seconds(), res.Kind.String(), mediaFormatFor(res, finalPath), "", "")
+		r.changes.record("not smaller", rel, rel, origSize, origSize, time.Since(t0).Seconds(), res.Kind.String(), mediaFormatFor(res, finalPath), "", encNote)
 		r.ensureHonestExt(path, res)
 		return
 	}
@@ -788,7 +789,7 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 		r.skipNotSmaller.Add(1)
 		r.addSize(path, path)
 		_ = r.store.MarkNoChange(ctx, srcHash, rel, res.Kind.String(), mediaFormatFor(res, finalPath), toolSelf, toolVersion, r.stampFor(res.Kind))
-		r.changes.record("not smaller", rel, rel, origInfo.Size(), newInfo.Size(), time.Since(t0).Seconds(), res.Kind.String(), mediaFormatFor(res, finalPath), "", "")
+		r.changes.record("not smaller", rel, rel, origInfo.Size(), newInfo.Size(), time.Since(t0).Seconds(), res.Kind.String(), mediaFormatFor(res, finalPath), "", encNote)
 		r.ensureHonestExt(path, res)
 		return
 	}
@@ -848,7 +849,7 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 	if still {
 		action = "still collapsed" // was a video hat: one frame kept, soundtrack dropped
 	}
-	r.changes.record(action, rel, newRel, srcSize, dstSize, time.Since(t0).Seconds(), res.Kind.String(), mediaFormatFor(res, finalPath), achieved, "")
+	r.changes.record(action, rel, newRel, srcSize, dstSize, time.Since(t0).Seconds(), res.Kind.String(), mediaFormatFor(res, finalPath), achieved, encNote)
 	if finalPath != path {
 		safefs.RemoveIfExists(path)
 	}
@@ -1113,25 +1114,34 @@ func (r *Runner) printBreak(print func()) {
 
 // achievedFor renders the actual result quality stored in the DB ("achieved"
 // column) — for future runs it answers "at what quality does this file already
-// sit, is there room to squeeze further?".
+// sit, is there room to squeeze further?". It leads with the encoder that won
+// ("svt crf=34 vmaf=96.4", "avifenc q=85"): encoder choice is audit data like
+// quality is, and the scales are not comparable across encoders.
 func (r *Runner) achievedFor(k detect.Kind, v media.VideoResult, p media.PhotoResult) string {
+	head := ""
 	switch k {
 	case detect.KindVideo:
 		if v.CRF == 0 {
 			return ""
 		}
-		if v.VMAF >= 0 {
-			return fmt.Sprintf("crf=%d vmaf=%.1f", v.CRF, v.VMAF)
+		if v.Codec != "" {
+			head = v.Codec + " "
 		}
-		return fmt.Sprintf("crf=%d", v.CRF)
+		if v.VMAF >= 0 {
+			return fmt.Sprintf("%scrf=%d vmaf=%.1f", head, v.CRF, v.VMAF)
+		}
+		return fmt.Sprintf("%scrf=%d", head, v.CRF)
 	case detect.KindImage:
 		if p.Q == 0 {
 			return ""
 		}
-		if p.VMAF >= 0 {
-			return fmt.Sprintf("q=%d vmaf=%.1f", p.Q, p.VMAF)
+		if p.Codec != "" {
+			head = p.Codec + " "
 		}
-		return fmt.Sprintf("q=%d", p.Q)
+		if p.VMAF >= 0 {
+			return fmt.Sprintf("%sq=%d vmaf=%.1f", head, p.Q, p.VMAF)
+		}
+		return fmt.Sprintf("%sq=%d", head, p.Q)
 	case detect.KindAnimated:
 		if r.opts.PhotoLoss {
 			return "lossless"
@@ -1140,6 +1150,19 @@ func (r *Runner) achievedFor(k detect.Kind, v media.VideoResult, p media.PhotoRe
 	default:
 		return ""
 	}
+}
+
+// attemptsComment joins the encoder audit trail (every encode + VMAF pass with
+// its duration) for the journal Comment column: "why did this file take N
+// minutes" is then answerable from the log alone, no verbose rerun needed.
+func attemptsComment(v media.VideoResult, p media.PhotoResult) string {
+	if len(v.Attempts) > 0 {
+		return strings.Join(v.Attempts, "; ")
+	}
+	if len(p.Attempts) > 0 {
+		return strings.Join(p.Attempts, "; ")
+	}
+	return ""
 }
 
 // changeLogPath puts the audit log next to the DB, sharing its base name:
