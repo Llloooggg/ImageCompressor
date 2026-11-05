@@ -95,17 +95,26 @@ func TestVideoFFArgsThreads(t *testing.T) {
 		}
 		return false
 	}
-	if a := videoFFArgs(svt, []string{"-c:a", "copy"}, 4, "s", "t"); !has(a, "-svtav1-params", "lp=4") {
+	if a := videoFFArgs(svt, []string{"-c:a", "copy"}, 4, false, "s", "t"); !has(a, "-svtav1-params", "lp=4") {
 		t.Errorf("svt call missing lp budget: %v", a)
 	}
-	if a := videoFFArgs(aom, []string{"-c:a", "copy"}, 4, "s", "t"); !has(a, "-threads", "4") {
+	if a := videoFFArgs(aom, []string{"-c:a", "copy"}, 4, false, "s", "t"); !has(a, "-threads", "4") {
 		t.Errorf("libaom call missing thread cap: %v", a)
 	}
-	if a := videoFFArgs(nv, []string{"-c:a", "copy"}, 4, "s", "t"); has(a, "-threads", "4") || has(a, "-svtav1-params", "lp=4") {
+	if a := videoFFArgs(nv, []string{"-c:a", "copy"}, 4, false, "s", "t"); has(a, "-threads", "4") || has(a, "-svtav1-params", "lp=4") {
 		t.Errorf("nvenc call must not carry CPU thread flags: %v", a)
 	}
-	if a := videoFFArgs(svt, []string{"-c:a", "copy"}, 0, "s", "t"); has(a, "-svtav1-params", "lp=0") {
+	if a := videoFFArgs(svt, []string{"-c:a", "copy"}, 0, false, "s", "t"); has(a, "-svtav1-params", "lp=0") {
 		t.Errorf("threads=0 must leave codec default: %v", a)
+	}
+	// normalize adds the honest bt709 color conversion (gbr-tagged screen
+	// recordings make AV1 encoders refuse to init: ffmpeg -22).
+	a := videoFFArgs(svt, []string{"-c:a", "copy"}, 4, true, "s", "t")
+	if !has(a, "-vf", "scale=out_color_matrix=bt709") || !has(a, "-colorspace", "bt709") {
+		t.Errorf("normalize pass missing bt709 conversion: %v", a)
+	}
+	if a := videoFFArgs(svt, []string{"-c:a", "copy"}, 4, false, "s", "t"); has(a, "-vf") {
+		t.Errorf("normal pass must not touch color: %v", a)
 	}
 }
 

@@ -71,3 +71,25 @@ func TestDetectJPEG(t *testing.T) {
 		t.Fatal(".jpg honest for jpeg")
 	}
 }
+
+func TestDetectAVI(t *testing.T) {
+	// RIFF <size> "AVI LIST" is the whole magic filetype needs.
+	avi := make([]byte, 16)
+	copy(avi[0:4], "RIFF")
+	binary.LittleEndian.PutUint32(avi[4:8], 1<<20)
+	copy(avi[8:16], "AVI LIST")
+	p := writeFile(t, "clip.avi", avi)
+	res, err := Detect(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Format != FmtAVI || res.Kind != KindVideo {
+		t.Fatalf("got %s/%s, want avi/video", res.Format, res.Kind)
+	}
+	if res.ExtensionLies {
+		t.Fatal(".avi honest for avi")
+	}
+	if FmtAVI.HonestExt() != ".avi" {
+		t.Fatalf("honest ext = %q", FmtAVI.HonestExt())
+	}
+}

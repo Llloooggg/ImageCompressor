@@ -436,9 +436,9 @@ func EncodeVideo(ctx context.Context, loc *tools.Locator, o Opts, chain VideoCha
 		return VideoResult{}, fmt.Errorf("no usable AV1 encoder for mode %q", o.Encoder)
 	}
 
-	attempt := func(ch VideoChain, audioArgs []string) (kept, ran bool, lastErr error) {
+	attempt := func(ch VideoChain, audioArgs []string, normalize bool) (kept, ran bool, lastErr error) {
 		for _, c := range ch.cands {
-			args := videoFFArgs(c, audioArgs, o.CPUBudget, src, tmp)
+			args := videoFFArgs(c, audioArgs, o.CPUBudget, normalize, src, tmp)
 			if err := run(loc, ff, args...); err != nil {
 				lastErr = fmt.Errorf("%s: %w", c.codec, err)
 				os.Remove(tmp)
@@ -457,9 +457,9 @@ func EncodeVideo(ctx context.Context, loc *tools.Locator, o Opts, chain VideoCha
 
 	// runLadder walks the whole ladder for one audio strategy, applying the
 	// VMAF guard + bisection to escalated winners (see function doc).
-	runLadder := func(audioArgs []string) (kept bool, info VideoResult, anyRan bool, lastErr error) {
+	runLadder := func(audioArgs []string, normalize bool) (kept bool, info VideoResult, anyRan bool, lastErr error) {
 		for i, lvl := range ladder {
-			kept, ran, err := attempt(chain.WithCRF(lvl), audioArgs)
+			kept, ran, err := attempt(chain.WithCRF(lvl), audioArgs, normalize)
 			if kept {
 				if i == 0 || o.VideoVMAFMin <= 0 {
 					return true, VideoResult{CRF: lvl, VMAF: -1}, true, nil // base level: user's order; or guard disabled
@@ -477,7 +477,7 @@ func EncodeVideo(ctx context.Context, loc *tools.Locator, o Opts, chain VideoCha
 					if mid <= lo || mid >= hi {
 						break
 					}
-					k2, ran2, e2 := attempt(chain.WithCRF(mid), audioArgs)
+					k2, ran2, e2 := attempt(chain.WithCRF(mid), audioArgs, normalize)
 					anyRan = anyRan || ran2
 					if e2 != nil {
 						lastErr = e2
@@ -506,7 +506,7 @@ func EncodeVideo(ctx context.Context, loc *tools.Locator, o Opts, chain VideoCha
 	}
 
 	// Pass 1: lossless audio copy across the ladder.
-	kept, info, anyRan, lastErr := runLadder([]string{"-c:a", "copy"})
+	kept, info, anyRan, lastErr := runLadder([]string{"-c:a", "copy"}, false)
 	if kept {
 		return info, nil
 	}
@@ -518,15 +518,34 @@ func EncodeVideo(ctx context.Context, loc *tools.Locator, o Opts, chain VideoCha
 
 	// Pass 2: audio copy failed for every encoder on every level ->
 	// container/audio incompatible. Transcode audio to AAC across the ladder.
-	kept, info, anyRan, lastErr = runLadder([]string{"-c:a", "aac", "-b:a", "192k"})
+	kept, info, anyRan, lastErr = runLadder([]string{"-c:a", "aac", "-b:a", "192k"}, false)
 	if kept {
 		return info, nil
 	}
 	if anyRan {
 		return VideoResult{}, ErrNotSmaller
 	}
+
+	// Pass 3: no encoder would even START (0 frames produced): exotic color
+	// space tags (gbr etc.) that AV1 encoders reject at init. Retry both
+	// audio strategies with an honest bt709 color conversion. This path can
+	// only help files that would otherwise error out.
+	kept, info, anyRan, err3 := runLadder([]string{"-c:a", "copy"}, true)
+	if kept {
+		return info, nil
+	}
+	if anyRan {
+		return VideoResult{}, ErrNotSmaller
+	}
+	kept, info, _, lastErr = runLadder([]string{"-c:a", "aac", "-b:a", "192k"}, true)
+	if kept {
+		return info, nil
+	}
 	if lastErr != nil {
 		return VideoResult{}, lastErr
+	}
+	if err3 != nil {
+		return VideoResult{}, err3
 	}
 	return VideoResult{}, ErrNotSmaller
 }
@@ -562,7 +581,11 @@ func vmafScore(ctx context.Context, loc *tools.Locator, ff, candidate, original 
 // videoFFArgs assembles an ffmpeg command for one video candidate + audio args.
 // threads grants each CPU encoder its slice of the core pool (0 = codec
 // default). GPU encoders (nvenc/amf/qsv) ignore it.
-func videoFFArgs(c cand, audioArgs []string, threads int, src, tmp string) []string {
+// normalize converts the stream to the bt709 YUV matrix and declares it:
+// streams tagged with exotic color spaces (gbr = RGB matrix from screen
+// recorders) make AV1 encoders REFUSE TO START (ffmpeg -22, zero frames);
+// converting honestly is the fix, so it is used as a fallback pass only.
+func videoFFArgs(c cand, audioArgs []string, threads int, normalize bool, src, tmp string) []string {
 	args := []string{
 		"-y", "-i", src,
 		"-map", "0:v:0",
@@ -579,6 +602,10 @@ func videoFFArgs(c cand, audioArgs []string, threads int, src, tmp string) []str
 		if threads > 0 {
 			args = append(args, "-threads", strconv.Itoa(threads))
 		}
+	}
+	if normalize {
+		args = append(args, "-vf", "scale=out_color_matrix=bt709",
+			"-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709")
 	}
 	args = append(args, audioArgs...)
 	args = append(args,

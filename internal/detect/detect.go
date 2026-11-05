@@ -56,6 +56,7 @@ const (
 	FmtMOV      Format = "mov"
 	FmtMatroska Format = "mkv"
 	FmtWebM     Format = "webm"
+	FmtAVI      Format = "avi"
 )
 
 var extFor = map[Format]string{
@@ -71,6 +72,7 @@ var extFor = map[Format]string{
 	FmtMOV:      ".mov",
 	FmtMatroska: ".mkv",
 	FmtWebM:     ".webm",
+	FmtAVI:      ".avi",
 }
 
 // HonestExt returns the extension that matches the real format.
@@ -98,7 +100,7 @@ func IsMediaExt(ext string) bool {
 }
 
 // videoFormats are the containers we treat as video.
-var videoFormats = map[Format]bool{FmtMP4: true, FmtMOV: true, FmtMatroska: true, FmtWebM: true}
+var videoFormats = map[Format]bool{FmtMP4: true, FmtMOV: true, FmtMatroska: true, FmtWebM: true, FmtAVI: true}
 
 // imageFormats are raster stills we can feed to an image encoder.
 var imageFormats = map[Format]bool{FmtJPEG: true, FmtPNG: true, FmtWebP: true, FmtBMP: true, FmtTIFF: true, FmtHEIC: true}
@@ -235,6 +237,8 @@ func formatFromType(t types.Type) Format {
 		return FmtMatroska
 	case "webm":
 		return FmtWebM
+	case "avi":
+		return FmtAVI
 	default:
 		return FmtUnknown
 	}

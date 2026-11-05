@@ -18,6 +18,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Llloooggg/ImageCompressor/internal/config"
 	"github.com/Llloooggg/ImageCompressor/internal/detect"
@@ -26,6 +27,7 @@ import (
 	"github.com/Llloooggg/ImageCompressor/internal/safefs"
 	"github.com/Llloooggg/ImageCompressor/internal/store"
 	"github.com/Llloooggg/ImageCompressor/internal/tools"
+	"github.com/Llloooggg/ImageCompressor/internal/vt"
 
 	"golang.org/x/sync/errgroup"
 )
@@ -50,6 +52,22 @@ type Runner struct {
 	origBytes, newBytes, scanBytes                                      atomic.Int64
 	done                                                                atomic.Int64
 	total                                                               int
+
+	multi     bool        // VT two-line status: counters + live "what is running now" line
+	firstDraw atomic.Bool // first VT repaint of this run
+	statusVis bool        // two-line block is currently on screen (guarded by statusMu)
+	statusMu  sync.Mutex  // one repaint at a time (ticker goroutine vs workers)
+	activeMu  sync.Mutex
+	active    []activeJob // files the workers are chewing on right now
+	lastDone  string      // most recently finished file + its processing time
+	lastDur   time.Duration
+}
+
+// activeJob is one file a worker is processing right now, for the live
+// status line ("which files are being worked on this second, how long").
+type activeJob struct {
+	rel   string
+	start time.Time
 }
 
 func New(cfg *config.Config, st *store.Store, loc *tools.Locator) *Runner {
@@ -210,6 +228,8 @@ func (r *Runner) Run(ctx context.Context) error {
 	// logs stay readable.
 	start := time.Now()
 	tty := isTerminal(os.Stdout)
+	r.multi = tty && vt.Enable(os.Stdout)
+	r.firstDraw.Store(true)
 	statusStop := make(chan struct{})
 	var statusWg sync.WaitGroup
 	if tty {
@@ -237,7 +257,10 @@ func (r *Runner) Run(ctx context.Context) error {
 			if gctx.Err() != nil {
 				return nil // stop requested: don't start new files
 			}
+			fileStart := time.Now()
+			r.trackStart(f)
 			r.process(gctx, f)
+			r.trackEnd(f, time.Since(fileStart))
 			n := r.done.Add(1)
 			if tty {
 				r.printStatus(start)
@@ -250,7 +273,10 @@ func (r *Runner) Run(ctx context.Context) error {
 	err = g.Wait()
 	close(statusStop)
 	statusWg.Wait()
-	if tty {
+	if r.multi && r.statusVis {
+		// cursor sits at the end of line 2: clear it, step up, clear line 1.
+		fmt.Print("\x1b[2K\r\x1b[1A\x1b[2K\r")
+	} else if tty && !r.multi {
 		fmt.Print("\r" + strings.Repeat(" ", 110) + "\r")
 	}
 	if err != nil {
@@ -260,13 +286,19 @@ func (r *Runner) Run(ctx context.Context) error {
 	return nil
 }
 
-// printStatus renders the single-line live status (TTY mode). Labels are kept
+// printStatus renders the live status (TTY mode). Labels are kept
 // terse/ASCII so the line stays readable regardless of the console codepage.
+// With VT available it is a two-line block: counters, then the files every
+// worker is on right now (name + elapsed) and the file that finished last.
+// Percent is TRUNCATED (not rounded): 46422/46423 shows 99%, never a fake
+// 100% while workers are still crunching.
 func (r *Runner) printStatus(start time.Time) {
+	r.statusMu.Lock()
+	defer r.statusMu.Unlock()
 	done := r.done.Load()
-	pct := 0.0
+	pct := 0
 	if r.total > 0 {
-		pct = 100 * float64(done) / float64(r.total)
+		pct = int(100 * done / int64(r.total))
 	}
 	el := time.Since(start)
 	savedMB := float64(r.origBytes.Load()-r.newBytes.Load()) / (1024 * 1024)
@@ -277,12 +309,90 @@ func (r *Runner) printStatus(start time.Time) {
 	if doneB > 0 && scanB > doneB {
 		eta = fmtDur(time.Duration(float64(el) * float64(scanB-doneB) / float64(doneB)))
 	}
-	line := fmt.Sprintf("[%s] %d/%d (%.0f%%)  ok:%d done:%d nofit:%d ext:%d err:%d  |  saved %.0f MB  |  ETA %s",
+	line := fmt.Sprintf("[%s] %d/%d (%d%%)  ok:%d already:%d nofit:%d ext:%d err:%d  |  saved %.0f MB  |  ETA %s",
 		fmtDur(el), done, r.total, pct,
 		r.processed.Load(), r.skipDone.Load(), r.skipNotSmaller.Load(),
 		r.fixedExt.Load(), r.errored.Load(),
 		savedMB, eta)
-	fmt.Print("\r" + fmt.Sprintf("%-110s", line))
+	if !r.multi {
+		fmt.Print("\r" + fmt.Sprintf("%-110s", line))
+		return
+	}
+	work := r.activeLine()
+	if r.firstDraw.Swap(false) {
+		fmt.Printf("%-110s\n\x1b[2K\r%-110s", line, work)
+	} else {
+		fmt.Print("\x1b[1A\x1b[2K\r" + fmt.Sprintf("%-110s\n\x1b[2K\r%-110s", line, work))
+	}
+	r.statusVis = true
+}
+
+// trackStart/trackEnd maintain the live list of in-flight files (only when
+// the two-line status is on; skips are tracked too, they are cheap).
+func (r *Runner) trackStart(path string) {
+	if !r.multi {
+		return
+	}
+	r.activeMu.Lock()
+	r.active = append(r.active, activeJob{rel: r.rel(path), start: time.Now()})
+	r.activeMu.Unlock()
+}
+
+func (r *Runner) trackEnd(path string, dur time.Duration) {
+	if !r.multi {
+		return
+	}
+	rel := r.rel(path)
+	r.activeMu.Lock()
+	for i := range r.active {
+		if r.active[i].rel == rel {
+			r.active = append(r.active[:i], r.active[i+1:]...)
+			break
+		}
+	}
+	r.lastDone, r.lastDur = rel, dur
+	r.activeMu.Unlock()
+}
+
+// activeLine names the in-flight files (base name + elapsed seconds) and the
+// file that finished most recently (base name + how long it took).
+func (r *Runner) activeLine() string {
+	r.activeMu.Lock()
+	parts := make([]string, 0, len(r.active))
+	for _, a := range r.active {
+		parts = append(parts, fmt.Sprintf("%s %ds", clip(filepath.Base(a.rel), 40), int(time.Since(a.start).Seconds())))
+	}
+	last, lastDur := r.lastDone, r.lastDur
+	r.activeMu.Unlock()
+
+	line := "now: "
+	switch {
+	case len(parts) == 0:
+		line += "--"
+	default:
+		joined := strings.Join(parts, " | ")
+		if joined = clip(joined, 92); len(parts) > 1 && strings.HasSuffix(joined, "...") {
+			joined += fmt.Sprintf(" +%d more", len(parts)-1)
+		}
+		line += joined
+	}
+	if last != "" {
+		line += fmt.Sprintf("  |  last: %s %.1fs", clip(filepath.Base(last), 40), lastDur.Seconds())
+	}
+	return clip(line, 110) // never exceed the repaint width: a wrap would break the cursor math
+}
+
+// clip truncates s to max bytes on a UTF-8 rune boundary (names in the
+// archive are Cyrillic/emoji; cutting mid-rune would print garbage).
+func clip(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	t := s[:max]
+	for len(t) > 0 && !utf8.ValidString(t) {
+		t = t[:len(t)-1]
+	}
+	return t + "..."
 }
 
 func fmtDur(d time.Duration) string {
@@ -492,7 +602,7 @@ func (r *Runner) process(ctx context.Context, path string) {
 			target = replaceExt(target, detect.FmtAVIF.HonestExt())
 			note = ", collapse still-image video to photo"
 		}
-		fmt.Printf("[dry-run] %s -> %s%s\n", rel, target, note)
+		r.printBreak(func() { fmt.Printf("[dry-run] %s -> %s%s\n", rel, target, note) })
 		return
 	}
 
@@ -510,6 +620,7 @@ func (r *Runner) legacyNeedsMigrate(h string) bool {
 }
 
 func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res detect.Result, still bool) {
+	t0 := time.Now() // per-file wall time -> journal Seconds column (how long this file took)
 	if still {
 		// The file collapses video -> photo: everything downstream (target
 		// extension, DB kind/format, achieved string, journal) follows the
@@ -566,7 +677,7 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 		r.skipNotSmaller.Add(1)
 		r.addSize(path, path)
 		_ = r.store.MarkNoChange(ctx, srcHash, rel, res.Kind.String(), mediaFormatFor(res, finalPath), toolSelf, toolVersion, r.stampFor(res.Kind))
-		r.changes.record("not smaller", rel, rel, origSize, origSize, res.Kind.String(), mediaFormatFor(res, finalPath), "", "")
+		r.changes.record("not smaller", rel, rel, origSize, origSize, time.Since(t0).Seconds(), res.Kind.String(), mediaFormatFor(res, finalPath), "", "")
 		r.ensureHonestExt(path, res)
 		return
 	}
@@ -578,11 +689,20 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 	}
 
 	// Transfer metadata into the temp (so the final file carries the originals).
+	// A real exiftool failure ABORTS the swap (temp dropped, original intact,
+	// err counted): metadata preservation is an invariant, and we never
+	// destroy the original until every invariant step succeeded. Next run
+	// retries. ErrNoExiftool stays a warning: a deployment without exiftool
+	// still compresses, that is not the file's fault and not worth an error
+	// storm across every file.
 	if err := meta.TransferTags(ctx, r.exif, path, tmp); err != nil {
-		if !errors.Is(err, meta.ErrNoExiftool) {
-			r.logf("meta %s: %v", rel, err)
-		} else {
+		if errors.Is(err, meta.ErrNoExiftool) {
 			r.logf("meta: exiftool not found, metadata may be lost: %s", rel)
+		} else {
+			safefs.RemoveIfExists(tmp)
+			r.errored.Add(1)
+			r.logf("meta %s: %v (not swapped, original intact, will retry next run)", rel, err)
+			return
 		}
 	}
 	// Restore original filesystem times before the swap.
@@ -610,7 +730,7 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 		r.skipNotSmaller.Add(1)
 		r.addSize(path, path)
 		_ = r.store.MarkNoChange(ctx, srcHash, rel, res.Kind.String(), mediaFormatFor(res, finalPath), toolSelf, toolVersion, r.stampFor(res.Kind))
-		r.changes.record("not smaller", rel, rel, origInfo.Size(), newInfo.Size(), res.Kind.String(), mediaFormatFor(res, finalPath), "", "")
+		r.changes.record("not smaller", rel, rel, origInfo.Size(), newInfo.Size(), time.Since(t0).Seconds(), res.Kind.String(), mediaFormatFor(res, finalPath), "", "")
 		r.ensureHonestExt(path, res)
 		return
 	}
@@ -670,7 +790,7 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 	if still {
 		action = "still collapsed" // was a video hat: one frame kept, soundtrack dropped
 	}
-	r.changes.record(action, rel, newRel, srcSize, dstSize, res.Kind.String(), mediaFormatFor(res, finalPath), achieved, "")
+	r.changes.record(action, rel, newRel, srcSize, dstSize, time.Since(t0).Seconds(), res.Kind.String(), mediaFormatFor(res, finalPath), achieved, "")
 	if finalPath != path {
 		safefs.RemoveIfExists(path)
 	}
@@ -697,7 +817,7 @@ func (r *Runner) ensureHonestExt(path string, res detect.Result) {
 		return
 	}
 	if r.cfg.DryRun {
-		fmt.Printf("[dry-run] fix-ext: %s -> %s\n", r.rel(path), r.rel(newPath))
+		r.printBreak(func() { fmt.Printf("[dry-run] fix-ext: %s -> %s\n", r.rel(path), r.rel(newPath)) })
 		return
 	}
 	if fileExists(newPath) {
@@ -714,7 +834,7 @@ func (r *Runner) ensureHonestExt(path string, res detect.Result) {
 		return
 	}
 	r.fixedExt.Add(1)
-	r.changes.record("ext renamed", r.rel(path), r.rel(newPath), sz, sz, res.Kind.String(), honest, "", "")
+	r.changes.record("ext renamed", r.rel(path), r.rel(newPath), sz, sz, 0, res.Kind.String(), honest, "", "")
 }
 
 func (r *Runner) fixExtOnly(path string, res detect.Result) {
@@ -727,7 +847,7 @@ func (r *Runner) fixExtOnly(path string, res detect.Result) {
 	}
 	newPath := replaceExt(path, honest)
 	if r.cfg.DryRun {
-		fmt.Printf("[dry-run] fix-ext: %s -> %s\n", r.rel(path), r.rel(newPath))
+		r.printBreak(func() { fmt.Printf("[dry-run] fix-ext: %s -> %s\n", r.rel(path), r.rel(newPath)) })
 		return
 	}
 	if err := os.Rename(path, newPath); err != nil {
@@ -900,8 +1020,26 @@ func logf(cfg *config.Config, format string, v ...any) {
 // r.logf logs an anomaly (console/log) AND mirrors it into the change log so
 // a double-click run keeps its full error trail on disk.
 func (r *Runner) logf(format string, v ...any) {
-	logf(r.cfg, format, v...)
-	r.changes.record("error", "", "", 0, 0, "", "", "", fmt.Sprintf(format, v...))
+	r.printBreak(func() { logf(r.cfg, format, v...) })
+	r.changes.record("error", "", "", 0, 0, 0, "", "", "", fmt.Sprintf(format, v...))
+}
+
+// printBreak safely emits a one-off console message (error, dry-run line)
+// while the two-line live status is up: erase the live block, print the
+// message as its own permanent line, force the next status repaint to start
+// fresh below it. Without this, stderr writes would corrupt the VT cursor
+// bookkeeping and smear the status block.
+func (r *Runner) printBreak(print func()) {
+	r.statusMu.Lock()
+	if r.multi {
+		if r.statusVis { // two-line block on screen: erase it before the message
+			fmt.Print("\x1b[2K\r\x1b[1A\x1b[2K\r")
+		}
+		r.statusVis = false
+		r.firstDraw.Store(true)
+	}
+	print()
+	r.statusMu.Unlock()
 }
 
 // achievedFor renders the actual result quality stored in the DB ("achieved"

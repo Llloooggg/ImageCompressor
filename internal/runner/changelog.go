@@ -20,7 +20,7 @@ type changeLog struct {
 	w  *bufio.Writer
 }
 
-const changeLogHeader = "Date\tAction\tSource\tResult\tSrcBytes\tDstBytes\tSavedBytes\tKind\tFormat\tQuality\tComment"
+const changeLogHeader = "Date\tAction\tSource\tResult\tSrcMB\tDstMB\tSavedMB\tSeconds\tKind\tFormat\tQuality\tComment"
 
 // openChangeLog appends to path (UTF-8 BOM + header written once so any
 // viewer shows Cyrillic correctly and the column names are visible).
@@ -36,14 +36,36 @@ func openChangeLog(path string) (*changeLog, error) {
 	cl := &changeLog{f: f, w: bufio.NewWriter(f)}
 	if fresh {
 		cl.w.WriteString("\ufeff" + changeLogHeader + "\n")
-		_ = cl.w.Flush()
+	} else if !headerMatches(path) {
+		// Column layout changed between program versions (bytes became MB,
+		// a Seconds column was added): restate the header exactly where the
+		// new-style rows begin so nobody misreads MB rows as byte rows.
+		cl.w.WriteString(changeLogHeader + "\n")
 	}
+	_ = cl.w.Flush()
 	return cl, nil
+}
+
+// headerMatches reports whether the existing log's first line already uses the
+// current column layout.
+func headerMatches(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return true // unreadable: don't risk duplicating the header
+	}
+	defer f.Close()
+	line, err := bufio.NewReader(f).ReadString('\n')
+	if err != nil && line == "" {
+		return true
+	}
+	return strings.TrimRight(strings.TrimPrefix(line, "\ufeff"), "\r\n") == changeLogHeader
 }
 
 // record writes one audit row. Tab/newline chars in fields are flattened so
 // the TSV column structure can never be corrupted by file names or messages.
-func (c *changeLog) record(action, src, dst string, srcSize, dstSize int64, kind, format, achieved, msg string) {
+// Sizes go out in MB (user request: raw byte counts were unreadable across a
+// 40k-line log); secs is how long this file took to process.
+func (c *changeLog) record(action, src, dst string, srcSize, dstSize int64, secs float64, kind, format, achieved, msg string) {
 	if c == nil {
 		return
 	}
@@ -53,11 +75,13 @@ func (c *changeLog) record(action, src, dst string, srcSize, dstSize int64, kind
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	fmt.Fprintf(c.w, "%s\t%s\t%s\t%s\t%d\t%d\t%d\t%s\t%s\t%s\t%s\n",
+	fmt.Fprintf(c.w, "%s\t%s\t%s\t%s\t%.3f\t%.3f\t%.3f\t%.1f\t%s\t%s\t%s\t%s\n",
 		time.Now().Format("2006-01-02 15:04:05"), flat(action), flat(src), flat(dst),
-		srcSize, dstSize, saved, flat(kind), flat(format), flat(achieved), flat(msg))
+		mbOf(srcSize), mbOf(dstSize), mbOf(saved), secs, flat(kind), flat(format), flat(achieved), flat(msg))
 	_ = c.w.Flush()
 }
+
+func mbOf(n int64) float64 { return float64(n) / (1024 * 1024) }
 
 func (c *changeLog) close() {
 	if c == nil {
