@@ -40,6 +40,8 @@ type Runner struct {
 	store       *store.Store
 	loc         *tools.Locator
 	opts        media.Opts
+	videoOpts   media.Opts // video clone: fat thread slice + preset (see lanes)
+	vsem        chan struct{}
 	vchain      media.VideoChain
 	exif        string
 	legacy      map[string]struct{}
@@ -63,35 +65,83 @@ type Runner struct {
 
 // activeJob is one file a worker is processing right now, for the live
 // status line ("which files are being worked on this second, how long").
+// The progress fields are video-only: the encode pass streams ffmpeg's
+// out_time_ms back, so a 40-minute pass shows its real position instead of
+// looking stuck. stage == "" means no encode pass is running (hash/skip/etc).
 type activeJob struct {
 	rel   string
 	start time.Time
+	stage string // ladder label ("crf28") or "queued" (waiting for a lane)
+	curMs int64  // encoded position in the current pass
+	durMs int64  // total media duration (header probe), 0 = unknown
 }
 
 func New(cfg *config.Config, st *store.Store, loc *tools.Locator) *Runner {
+	opts := media.Opts{
+		PhotoQ:       cfg.PhotoQ,
+		PhotoLoss:    cfg.PhotoLoss,
+		PhotoSpeed:   cfg.PhotoSpeed,
+		PhotoVMAFMin: cfg.PhotoVMAF,
+		VideoCRF:     cfg.VideoCRF,
+		VideoVMAFMin: cfg.VideoVMAF,
+		Encoder:      cfg.VideoEnc,
+		VideoPreset:  cfg.VideoPreset,
+		// Auto core split: every child encoder/vmaf gets its slice instead
+		// of greedily grabbing all cores (N workers × all-cores children just
+		// thrash each other). Thread count does NOT change encoder output
+		// (aom/svt/libvmaf are thread-deterministic), so the nochange
+		// stamps deliberately exclude it.
+		CPUBudget: childBudget(cfg.Workers),
+	}
+	// Video lanes (the battle fix): SVT-AV1 given lp=2 on a 24-thread box
+	// runs at a third of its speed and starves the whole machine (~55% CPU
+	// in the FData run). Heavy video encodes therefore run a few at a time
+	// with a fat thread slice each; photos (1-3 s avifenc jobs) keep the
+	// original worker-wide split and never wait for a lane.
+	lanes := videoLanes(cfg)
+	videoOpts := opts
+	videoOpts.CPUBudget = childBudget(lanes)
 	return &Runner{
-		cfg:   cfg,
-		store: st,
-		loc:   loc,
-		opts: media.Opts{
-			PhotoQ:       cfg.PhotoQ,
-			PhotoLoss:    cfg.PhotoLoss,
-			PhotoSpeed:   cfg.PhotoSpeed,
-			PhotoVMAFMin: cfg.PhotoVMAF,
-			VideoCRF:     cfg.VideoCRF,
-			VideoVMAFMin: cfg.VideoVMAF,
-			Encoder:      cfg.VideoEnc,
-			// Auto core split: every child encoder/vmaf gets its slice instead
-			// of greedily grabbing all cores (N workers × all-cores children just
-			// thrash each other). Thread count does NOT change encoder output
-			// (aom/svt/libvmaf are thread-deterministic), so the nochange
-			// stamps deliberately exclude it.
-			CPUBudget: childBudget(cfg.Workers),
-		},
+		cfg:        cfg,
+		store:      st,
+		loc:        loc,
+		opts:       opts,
+		videoOpts:  videoOpts,
+		vsem:       make(chan struct{}, lanes),
 		exif:       loc.Exiftool(),
 		hasAvifenc: loc.Avifenc() != "",
 		hasFFmpeg:  loc.FFmpeg() != "",
 	}
+}
+
+// DefaultVideoLanes: how many heavy video encodes run side by side by auto.
+// ~8 threads each is where SVT-AV1 finally unfolds (its lookahead/EBT
+// pipeline stops scaling below ~6-8 threads); photos and skips still use
+// every worker slot, they just queue behind lanes cheaply.
+func DefaultVideoLanes() int {
+	n := runtime.NumCPU() / 8
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
+// videoLanes resolves the lane count: explicit --video-workers, or auto;
+// never more lanes than workers (a lane needs a worker to drive it) and
+// never less than one.
+func videoLanes(cfg *config.Config) int {
+	lanes := cfg.VideoWorkers
+	if lanes <= 0 {
+		lanes = DefaultVideoLanes()
+	}
+	w := cfg.Workers
+	if w < 1 {
+		w = 1
+	}
+	if lanes > w {
+		lanes = w
+	}
+	return lanes
 }
 
 // childBudget = cores per worker (floor 1): the auto-computed slice of the
@@ -107,14 +157,39 @@ func childBudget(workers int) int {
 	return t
 }
 
+// videoSchedExts are file extensions treated as heavy video for QUEUEING
+// only (videosLast). This never decides what a file IS: classification and
+// honest extensions remain magic-bytes-only (canon).
+var videoSchedExts = map[string]bool{
+	".mp4": true, ".mov": true, ".mkv": true, ".webm": true, ".avi": true, ".m4v": true,
+}
+
+// videosLast stably moves extension-video files to the back of the queue:
+// photos, animated gifs and non-media copies drain through every worker,
+// then videos spread across the lanes. Mislabelled files keep their
+// magic-byte behavior either way; only the order they are attempted in
+// changes.
+func videosLast(files []string) []string {
+	head := make([]string, 0, len(files))
+	tail := make([]string, 0)
+	for _, f := range files {
+		if videoSchedExts[strings.ToLower(filepath.Ext(f))] {
+			tail = append(tail, f)
+		} else {
+			head = append(head, f)
+		}
+	}
+	return append(head, tail...)
+}
+
 // stampFor fingerprints the settings that decide "can this shrink?". A nochange
 // record with a matching stamp is skipped on later runs; a different stamp makes
-// us re-evaluate (so changing --photo-q/--photo-vmaf-min/--video-crf/encoder
-// takes effect).
+// us re-evaluate (so changing --photo-q/--photo-vmaf-min/--video-crf/encoder/
+// --video-preset takes effect).
 func (r *Runner) stampFor(k detect.Kind) string {
 	switch k {
 	case detect.KindVideo:
-		return fmt.Sprintf("vid|%d|%.0f|%s|ff=%v|still=%v", r.opts.VideoCRF, r.opts.VideoVMAFMin, r.opts.Encoder, r.hasFFmpeg, r.cfg.Still)
+		return fmt.Sprintf("vid|%d|%.0f|%s|preset=%d|ff=%v|still=%v", r.opts.VideoCRF, r.opts.VideoVMAFMin, r.opts.Encoder, r.opts.VideoPreset, r.hasFFmpeg, r.cfg.Still)
 	case detect.KindAnimated:
 		return fmt.Sprintf("anim|%d|%v|avifenc=%v|ff=%v", r.opts.PhotoQ, r.opts.PhotoLoss, r.hasAvifenc, r.hasFFmpeg)
 	default:
@@ -208,6 +283,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	avail := media.ProbeAV1Encoders(ctx, r.loc)
 	r.vchain = r.opts.BuildVideoChain(avail)
 	fmt.Printf("Video encoders, mode %q: %s\n", r.opts.Encoder, chainString(r.vchain))
+	fmt.Printf("Video lanes: %d side by side, %d threads each\n", cap(r.vsem), r.videoOpts.CPUBudget)
 	if r.cfg.Still {
 		fmt.Println("Still-image video collapse: on, one static frame with a soundtrack becomes a photo, use --no-still to keep such files as videos")
 	} else {
@@ -218,6 +294,10 @@ func (r *Runner) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// Scheduling hint only (detection still trusts nothing but magic bytes):
+	// videos queue last so quick photo/skip work drains the workers first,
+	// instead of 12 workers parking on 3 hot lanes while photos wait 40 min.
+	files = videosLast(files)
 	r.total = len(files)
 	fmt.Printf("Files found: %d\n", r.total)
 
@@ -379,12 +459,30 @@ func (r *Runner) statusBlock(header string, maxw int) []string {
 	for i := 0; i < workers; i++ {
 		if i < len(jobs) {
 			j := jobs[i]
-			lines = append(lines, clip(fmt.Sprintf("%2d  %8s  %s", i+1, fmtDurShort(now.Sub(j.start)), j.rel), clipw))
+			lines = append(lines, clip(fmt.Sprintf("%2d  %8s  %-18s  %s", i+1, fmtDurShort(now.Sub(j.start)), slotPos(j), j.rel), clipw))
 		} else {
-			lines = append(lines, fmt.Sprintf("%2d  %8s", i+1, "--"))
+			lines = append(lines, fmt.Sprintf("%2d  %8s  %s", i+1, "--", "--"))
 		}
 	}
 	return lines
+}
+
+// slotPos renders the middle column of a worker slot: the live position of
+// the video encode pass ("crf28 4:31/13:22"), the queue wait for a lane
+// ("queued"), or empty for everything else (photos, hashing, metadata).
+// The battle complaint it answers: "is this file stuck or moving?".
+func slotPos(j activeJob) string {
+	if j.stage == "" {
+		return ""
+	}
+	if j.stage == "queued" {
+		return "queued"
+	}
+	cur := fmtDurShort(time.Duration(j.curMs) * time.Millisecond)
+	if j.durMs <= 0 {
+		return j.stage + " " + cur // duration unknown: position alone still proves movement
+	}
+	return j.stage + " " + cur + "/" + fmtDurShort(time.Duration(j.durMs)*time.Millisecond)
 }
 
 // fmtDurShort renders an in-flight elapsed time compactly: "45s" under a
@@ -434,6 +532,41 @@ func (r *Runner) trackEnd(path string) {
 	for i := range r.active {
 		if r.active[i].rel == rel {
 			r.active = append(r.active[:i], r.active[i+1:]...)
+			break
+		}
+	}
+	r.activeMu.Unlock()
+}
+
+// trackTotal records the media duration (ms) of an in-flight file once the
+// header probe succeeded, so the slot can show position/total. Takes rel
+// directly: the encode site already resolved it.
+func (r *Runner) trackTotal(rel string, durMs int64) {
+	if !r.multi {
+		return
+	}
+	r.activeMu.Lock()
+	for i := range r.active {
+		if r.active[i].rel == rel {
+			r.active[i].durMs = durMs
+			break
+		}
+	}
+	r.activeMu.Unlock()
+}
+
+// trackProgress applies one ffmpeg -progress sample (stage label + stream
+// position) to the in-flight slot. Called from the encoder's output scanner;
+// cheap and lock-scoped, progress lines arrive a few times per second.
+func (r *Runner) trackProgress(rel, stage string, curMs int64) {
+	if !r.multi {
+		return
+	}
+	r.activeMu.Lock()
+	for i := range r.active {
+		if r.active[i].rel == rel {
+			r.active[i].stage = stage
+			r.active[i].curMs = curMs
 			break
 		}
 	}
@@ -716,7 +849,35 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 	case detect.KindAnimated:
 		encErr = media.EncodeAnimated(ctx, r.loc, r.opts, path, tmp)
 	case detect.KindVideo:
-		vinfo, encErr = media.EncodeVideo(ctx, r.loc, r.opts, r.vchain, path, tmp, origSize)
+		// Heavy AV1 passes run a few files at a time on the video lanes
+		// (each lane child gets cores/lanes threads, so SVT-AV1 unfolds);
+		// the wait for a lane is visible in the slot as "queued". The
+		// duration header probe (no decode, no ffprobe per canon) lets the
+		// slot show position/total for the running pass.
+		var durMs int64 = -1
+		if r.multi {
+			durMs = media.InspectDuration(ctx, r.loc, path)
+			if durMs >= 0 {
+				r.trackTotal(rel, durMs)
+			}
+			r.trackProgress(rel, "queued", 0)
+		}
+		acquired := false
+		select {
+		case r.vsem <- struct{}{}:
+			acquired = true
+		case <-ctx.Done():
+		}
+		if acquired {
+			var prog func(label string, curMs int64)
+			if r.multi {
+				prog = func(label string, curMs int64) { r.trackProgress(rel, label, curMs) }
+			}
+			vinfo, encErr = media.EncodeVideo(ctx, r.loc, r.videoOpts, r.vchain, path, tmp, origSize, prog)
+			<-r.vsem
+		} else {
+			encErr = ctx.Err() // stop request while queued: not an error (checked below)
+		}
 	default:
 		encErr = errors.New("unsupported media kind")
 	}

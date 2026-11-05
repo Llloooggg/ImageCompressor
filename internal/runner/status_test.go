@@ -135,3 +135,70 @@ func TestStatusBlockSlots(t *testing.T) {
 		}
 	}
 }
+
+func TestStatusSlotProgress(t *testing.T) {
+	r := &Runner{multi: true, processRoot: `C:\arc`, cfg: &config.Config{Workers: 1}}
+	r.trackStart(`C:\arc\family\nina.mkv`)
+	rel := `family\nina.mkv`
+
+	// no encode yet: middle column empty, path still visible
+	lines := r.statusBlock("hdr", 200)
+	if !strings.Contains(lines[1], `family\nina.mkv`) {
+		t.Fatalf("slot lost the path: %q", lines[1])
+	}
+
+	// lane wait must be visible (the battle complaint: "stuck or moving?")
+	r.trackProgress(rel, "queued", 0)
+	lines = r.statusBlock("hdr", 200)
+	if !strings.Contains(lines[1], "queued") {
+		t.Errorf("lane wait must show queued: %q", lines[1])
+	}
+
+	// encode pass with known duration: position/total in the slot
+	r.trackTotal(rel, 802_000) // 13:22 of media (the nina case, scaled down)
+	r.trackProgress(rel, "crf28", 271_000)
+	lines = r.statusBlock("hdr", 200)
+	if !strings.Contains(lines[1], "crf28 4:31/13:22") {
+		t.Errorf("encode position column wrong: %q", lines[1])
+	}
+
+	// unknown duration: position alone still proves movement
+	r2 := &Runner{multi: true, processRoot: `C:\arc`, cfg: &config.Config{Workers: 1}}
+	r2.trackStart(`C:\arc\family\nina.mkv`)
+	r2.trackProgress(rel, "crf34", 65_000)
+	lines = r2.statusBlock("hdr", 200)
+	if !strings.Contains(lines[1], "crf34 1:05") || strings.Contains(lines[1], "/") {
+		t.Errorf("unknown-duration pass must show position only: %q", lines[1])
+	}
+}
+
+func TestVideoLanesClamp(t *testing.T) {
+	// explicit lanes never exceed workers; 0 means auto (env-dependent, so
+	// only assert it is at least 1 and within workers)
+	if got := videoLanes(&config.Config{VideoWorkers: 5, Workers: 3}); got != 3 {
+		t.Errorf("lanes must clamp to workers: %d", got)
+	}
+	if got := videoLanes(&config.Config{VideoWorkers: -4, Workers: 2}); got != 2 {
+		t.Errorf("auto lanes must clamp to workers: %d", got)
+	}
+	if got := videoLanes(&config.Config{VideoWorkers: 0, Workers: 0}); got != 1 {
+		t.Errorf("lanes floor must be 1: %d", got)
+	}
+	if got := DefaultVideoLanes(); got < 1 {
+		t.Errorf("DefaultVideoLanes must be >= 1: %d", got)
+	}
+}
+
+func TestVideosLast(t *testing.T) {
+	in := []string{
+		`a\clip.MP4`, `a\photo.jpg`, `a\movie.mkv`, `a\notes.txt`, `a\clip.webm`, `a\pic.jpeg`,
+	}
+	got := videosLast(in)
+	want := []string{`a\photo.jpg`, `a\notes.txt`, `a\pic.jpeg`, `a\clip.MP4`, `a\movie.mkv`, `a\clip.webm`}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("videosLast = %v, want %v", got, want)
+			break
+		}
+	}
+}

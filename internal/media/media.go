@@ -2,15 +2,20 @@
 // writing to a caller-provided temp path. It never touches the original and
 // never decides about DB/rename — that is the runner's job (crash-safe protocol).
 //
-// Video encoding is GPU-first with CPU fallback: by default it tries a hardware
-// AV1 encoder (nvenc/amf/qsv) and falls back to SVT-AV1 (CPU) on failure.
+// Video encoding is CPU-first by canon (SVT-AV1): hardware encoders are
+// opt-in via the encoder mode, because their quality scale is not comparable
+// and their "wins" cost archive size.
 package media
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -42,6 +47,55 @@ type Opts struct {
 	VideoVMAFMin float64 // min acceptable VMAF for ESCALATED levels (0 disables the guard)
 	Encoder      string
 	CPUBudget    int // threads granted to each child encoder/vmaf (0 = codec default)
+	VideoPreset  int // SVT-AV1 preset (cpu-used for libaom), 0 = codec default
+}
+
+// InspectDuration reads the container header via `ffmpeg -i` (headers only,
+// no decode, no ffprobe — per canon ffprobe is never resolved) and returns
+// the media duration. -1 = unknown/unreadable. Feeds the live status slot
+// (total length column) so a long encode can show real position, not just
+// wall-clock elapsed.
+func InspectDuration(ctx context.Context, loc *tools.Locator, src string) int64 {
+	ff := loc.FFmpeg()
+	if ff == "" {
+		return -1
+	}
+	out, err := loc.Run(ctx, ff, "-hide_banner", "-i", src, "-frames:v", "0", "-f", "null", "-")
+	if err != nil {
+		// ffmpeg exits non-zero for "0 frames" runs; the banner is still there.
+		if i := bytes.Index(out, []byte("Duration:")); i < 0 {
+			return -1
+		}
+	}
+	return parseDurationFF(out)
+}
+
+// parseDurationFF extracts "Duration: HH:MM:SS.xx" from ffmpeg banner output.
+func parseDurationFF(out []byte) int64 {
+	i := bytes.Index(out, []byte("Duration:"))
+	if i < 0 {
+		return -1
+	}
+	var h, m, s, cs int
+	if _, err := fmt.Sscanf(string(out[i+9:]), " %d:%d:%d.%d", &h, &m, &s, &cs); err != nil {
+		return -1
+	}
+	return ((int64(h)*60+int64(m))*60+int64(s))*1000 + int64(cs)*10
+}
+
+// parseOutTimeMs extracts out_time_ms=<us> from one ffmpeg `-progress` line
+// (machine-readable key=value stream on stderr/stdout).
+func parseOutTimeMs(line string) (int64, bool) {
+	const p = "out_time_ms="
+	i := strings.Index(line, p)
+	if i < 0 {
+		return 0, false
+	}
+	var us int64
+	if _, err := fmt.Sscanf(line[i+len(p):], "%d", &us); err != nil {
+		return 0, false
+	}
+	return us / 1000, true
 }
 
 // PhotoResult reports what EncodeImage actually achieved when it kept a temp:
@@ -384,7 +438,7 @@ func ProbeAV1Encoders(ctx context.Context, loc *tools.Locator) map[string]bool {
 		}
 		pctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		args := append([]string{"-hide_banner", "-loglevel", "error", "-f", "lavfi",
-			"-i", "testsrc=s=320x240:r=24", "-frames:v", "2", "-pix_fmt", "yuv420p",
+			"-i", "testsrc=s=320x240:r=24", "-frames:v", "2", "-pix_fmt", "yuv420p10le",
 			"-c:v", codec}, q...)
 		args = append(args, "-f", "null", "-")
 		_, err := loc.Run(pctx, ff, args...)
@@ -468,6 +522,10 @@ type VideoResult struct {
 // the base quality is retried at coarser qualities instead of being skipped).
 // Only if NO level shrinks it do we return ErrNotSmaller.
 //
+// progress (optional, may be nil) receives (ladder label, stream position)
+// while each encode pass runs — it feeds the live status slot's position
+// column, so a 40-minute encode is visibly moving, not "stuck".
+//
 // Quality guard: the BASE level is taken as-is (it is the user's quality
 // order), but an ESCALATED winner is verified against the original with
 // libvmaf. If the difference is visible (VMAF < floor) we bisection-search
@@ -478,7 +536,7 @@ type VideoResult struct {
 // Audio is copied losslessly; if that fails for ALL encoders on ALL levels
 // (audio codec incompatible with MP4, e.g. Opus/Vorbis) it retries the whole
 // ladder transcoding audio to AAC so the file is still valid and usually smaller.
-func EncodeVideo(ctx context.Context, loc *tools.Locator, o Opts, chain VideoChain, src, tmp string, origSize int64) (VideoResult, error) {
+func EncodeVideo(ctx context.Context, loc *tools.Locator, o Opts, chain VideoChain, src, tmp string, origSize int64, progress func(label string, curMs int64)) (VideoResult, error) {
 	ff := loc.FFmpeg()
 	if ff == "" {
 		return VideoResult{}, fmt.Errorf("no encoder: ffmpeg not found for video")
@@ -494,9 +552,9 @@ func EncodeVideo(ctx context.Context, loc *tools.Locator, o Opts, chain VideoCha
 
 	attempt := func(ch VideoChain, audioArgs []string, normalize bool, label string) (kept, ran bool, lastErr error, win string) {
 		for _, c := range ch.cands {
-			args := videoFFArgs(c, audioArgs, o.CPUBudget, normalize, src, tmp)
+			args := videoFFArgs(c, audioArgs, o.CPUBudget, o.VideoPreset, normalize, src, tmp)
 			t0 := time.Now()
-			if err := run(loc, ff, args...); err != nil {
+			if err := runEnc(ctx, loc, ff, progress, label, args...); err != nil {
 				lastErr = fmt.Errorf("%s: %w", c.codec, err)
 				os.Remove(tmp)
 				record(fmt.Sprintf("%s %s fail", codecShort(c.codec), label), time.Since(t0))
@@ -648,12 +706,17 @@ func vmafScore(ctx context.Context, loc *tools.Locator, ff, candidate, original 
 
 // videoFFArgs assembles an ffmpeg command for one video candidate + audio args.
 // threads grants each CPU encoder its slice of the core pool (0 = codec
-// default). GPU encoders (nvenc/amf/qsv) ignore it.
+// default). GPU encoders (nvenc/amf/qsv) ignore it. preset is the SVT-AV1
+// preset (2..12, 0 = codec default; smaller = smarter and slower).
 // normalize converts the stream to the bt709 YUV matrix and declares it:
 // streams tagged with exotic color spaces (gbr = RGB matrix from screen
 // recorders) make AV1 encoders REFUSE TO START (ffmpeg -22, zero frames);
 // converting honestly is the fix, so it is used as a fallback pass only.
-func videoFFArgs(c cand, audioArgs []string, threads int, normalize bool, src, tmp string) []string {
+// Every AV1 output is forced to 10-bit (yuv420p10le): the codec math prefers
+// it even for 8-bit sources (cleaner gradients/darks, slightly smaller files),
+// and ProbeAV1Encoders uses the same pix_fmt so hardware that cannot encode
+// 10-bit AV1 never enters the chain.
+func videoFFArgs(c cand, audioArgs []string, threads, preset int, normalize bool, src, tmp string) []string {
 	args := []string{
 		"-y", "-i", src,
 		"-map", "0:v:0",
@@ -663,6 +726,9 @@ func videoFFArgs(c cand, audioArgs []string, threads int, normalize bool, src, t
 	args = append(args, splitQuality(c.flag, c.value)...)
 	switch c.codec {
 	case "libsvtav1":
+		if preset > 0 {
+			args = append(args, "-preset", strconv.Itoa(clamp(preset, 0, 12)))
+		}
 		if threads > 0 {
 			args = append(args, "-svtav1-params", fmt.Sprintf("lp=%d", threads))
 		}
@@ -671,6 +737,7 @@ func videoFFArgs(c cand, audioArgs []string, threads int, normalize bool, src, t
 			args = append(args, "-threads", strconv.Itoa(threads))
 		}
 	}
+	args = append(args, "-pix_fmt", "yuv420p10le")
 	if normalize {
 		args = append(args, "-vf", "scale=out_color_matrix=bt709",
 			"-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709")
@@ -711,6 +778,54 @@ func aomCRFFromQ(q int, lossless bool) int {
 func run(loc *tools.Locator, toolPath string, args ...string) error {
 	_, err := loc.Run(context.Background(), toolPath, args...)
 	return err
+}
+
+// runEnc runs one encode pass; with a progress callback it asks ffmpeg for
+// machine-readable progress (-progress pipe:2) and streams out_time_ms lines
+// back as (ladder label, current position). ffmpeg writes progress to stderr
+// (as everything else), so the scanner reads that pipe and keeps the log tail
+// for error reporting.
+func runEnc(ctx context.Context, loc *tools.Locator, toolPath string, progress func(label string, curMs int64), label string, args ...string) error {
+	if progress == nil {
+		_, err := loc.Run(ctx, toolPath, args...)
+		return err
+	}
+	cmd := exec.CommandContext(ctx, toolPath, append(args, "-progress", "pipe:2")...)
+	cmd.Stdin = nil
+	cmd.Stdout = io.Discard
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	var log bytes.Buffer
+	sc := bufio.NewScanner(stderr)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		line := sc.Text()
+		if ms, ok := parseOutTimeMs(line); ok {
+			progress(label, ms)
+			continue
+		}
+		log.WriteString(line)
+		log.WriteByte('\n')
+	}
+	if err := cmd.Wait(); err != nil {
+		return fmt.Errorf("%w: %s", err, tailStr(log.String(), 300))
+	}
+	return nil
+}
+
+// tailStr keeps the last n bytes of s (ffmpeg's useful failure detail is at
+// the end of its stderr).
+func tailStr(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= n {
+		return s
+	}
+	return "..." + s[len(s)-n:]
 }
 
 func clamp(v, lo, hi int) int {

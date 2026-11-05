@@ -114,26 +114,70 @@ func TestVideoFFArgsThreads(t *testing.T) {
 		}
 		return false
 	}
-	if a := videoFFArgs(svt, []string{"-c:a", "copy"}, 4, false, "s", "t"); !has(a, "-svtav1-params", "lp=4") {
+	if a := videoFFArgs(svt, []string{"-c:a", "copy"}, 4, 0, false, "s", "t"); !has(a, "-svtav1-params", "lp=4") {
 		t.Errorf("svt call missing lp budget: %v", a)
 	}
-	if a := videoFFArgs(aom, []string{"-c:a", "copy"}, 4, false, "s", "t"); !has(a, "-threads", "4") {
+	if a := videoFFArgs(aom, []string{"-c:a", "copy"}, 4, 0, false, "s", "t"); !has(a, "-threads", "4") {
 		t.Errorf("libaom call missing thread cap: %v", a)
 	}
-	if a := videoFFArgs(nv, []string{"-c:a", "copy"}, 4, false, "s", "t"); has(a, "-threads", "4") || has(a, "-svtav1-params", "lp=4") {
+	if a := videoFFArgs(nv, []string{"-c:a", "copy"}, 4, 0, false, "s", "t"); has(a, "-threads", "4") || has(a, "-svtav1-params", "lp=4") {
 		t.Errorf("nvenc call must not carry CPU thread flags: %v", a)
 	}
-	if a := videoFFArgs(svt, []string{"-c:a", "copy"}, 0, false, "s", "t"); has(a, "-svtav1-params", "lp=0") {
+	if a := videoFFArgs(svt, []string{"-c:a", "copy"}, 0, 0, false, "s", "t"); has(a, "-svtav1-params", "lp=0") {
 		t.Errorf("threads=0 must leave codec default: %v", a)
+	}
+	// preset is the SVT-AV1 knob (0 = codec default, no flag emitted).
+	if a := videoFFArgs(svt, []string{"-c:a", "copy"}, 4, 8, false, "s", "t"); !has(a, "-preset", "8") {
+		t.Errorf("svt call missing preset: %v", a)
+	}
+	if a := videoFFArgs(svt, []string{"-c:a", "copy"}, 4, 0, false, "s", "t"); has(a, "-preset") {
+		t.Errorf("preset=0 must leave codec default: %v", a)
+	}
+	// canon: every AV1 output is 10-bit (probe uses the same pix_fmt, so a
+	// machine that enters the chain always produced 10-bit in the probe too).
+	for _, c := range []cand{svt, aom, nv} {
+		if a := videoFFArgs(c, []string{"-c:a", "copy"}, 4, 8, false, "s", "t"); !has(a, "-pix_fmt", "yuv420p10le") {
+			t.Errorf("%s call must force yuv420p10le: %v", c.codec, a)
+		}
 	}
 	// normalize adds the honest bt709 color conversion (gbr-tagged screen
 	// recordings make AV1 encoders refuse to init: ffmpeg -22).
-	a := videoFFArgs(svt, []string{"-c:a", "copy"}, 4, true, "s", "t")
+	a := videoFFArgs(svt, []string{"-c:a", "copy"}, 4, 8, true, "s", "t")
 	if !has(a, "-vf", "scale=out_color_matrix=bt709") || !has(a, "-colorspace", "bt709") {
 		t.Errorf("normalize pass missing bt709 conversion: %v", a)
 	}
-	if a := videoFFArgs(svt, []string{"-c:a", "copy"}, 4, false, "s", "t"); has(a, "-vf") {
+	if a := videoFFArgs(svt, []string{"-c:a", "copy"}, 4, 8, false, "s", "t"); has(a, "-vf") {
 		t.Errorf("normal pass must not touch color: %v", a)
+	}
+}
+
+func TestParseDurationFF(t *testing.T) {
+	cases := []struct {
+		in   string
+		want int64
+	}{
+		{"Input #0, mov,mp4, Duration: 01:30:22.40, start: 0.000000, bitrate: 1400 kb/s\n", 5422400},
+		{"Duration: 00:00:03.04, start: 0.000000", 3040},
+		{"Duration: N/A, start: 0.0", -1},
+		{"no duration here at all", -1},
+	}
+	for _, c := range cases {
+		if got := parseDurationFF([]byte(c.in)); got != c.want {
+			t.Errorf("parseDurationFF(%q) = %d, want %d", c.in, got, c.want)
+		}
+	}
+}
+
+func TestParseOutTimeMs(t *testing.T) {
+	// ffmpeg's out_time_ms quirk: the value is MICROseconds despite the name.
+	if ms, ok := parseOutTimeMs("out_time_ms=1234567"); !ok || ms != 1234 {
+		t.Errorf("out_time_ms=1234567 -> %d,%v want 1234,true", ms, ok)
+	}
+	if _, ok := parseOutTimeMs("frame=42"); ok {
+		t.Errorf("non-progress line must be ignored")
+	}
+	if _, ok := parseOutTimeMs("out_time_ms=abc"); ok {
+		t.Errorf("garbage value must be ignored")
 	}
 }
 
