@@ -44,12 +44,40 @@ func TestChangeLogMBAndSeconds(t *testing.T) {
 	}
 }
 
-func TestChangeLogHeaderRestatedOnOldFormat(t *testing.T) {
+// Every new run on an existing log starts with a blank separator + a fresh
+// header, so run boundaries are visible while scrolling (and the header always
+// matches the columns of the rows under it, old byte-size rows included).
+func TestChangeLogHeaderPerRun(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "old.log")
-	old := "Date\tAction\tSource\tResult\tSrcBytes\tDstBytes\tSavedBytes\tKind\tFormat\tQuality\tComment\n"
-	if err := os.WriteFile(p, []byte("\ufeff"+old), 0o644); err != nil {
+	old := "\ufeffDate\tAction\tSource\tResult\tSrcBytes\tDstBytes\tSavedBytes\tKind\tFormat\tQuality\tComment\n2026-01-01 00:00:00\tcompressed\told.mp4\told.mp4\t28538\t27200\t1338\tvideo\tmp4\tcrf=34\t\n"
+	if err := os.WriteFile(p, []byte(old), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	for i := 0; i < 2; i++ {
+		cl, err := openChangeLog(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cl.record("error", "", "", 0, 0, 0, "", "", "", "boom")
+		cl.close()
+	}
+
+	b, _ := os.ReadFile(p)
+	text := string(b)
+	if got := strings.Count(text, changeLogHeader+"\n"); got != 2 {
+		t.Fatalf("each run restates the header once: got %d, want 2, log=%q", got, text)
+	}
+	if !strings.Contains(text, "\n\n"+changeLogHeader) {
+		t.Errorf("blank separator must precede each fresh header: %q", text)
+	}
+	if !strings.Contains(text, old) {
+		t.Errorf("previous run's rows must be preserved: %q", text)
+	}
+}
+
+// a brand-new file gets BOM + header exactly once (no leading separator).
+func TestChangeLogFreshFile(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "new.log")
 	cl, err := openChangeLog(p)
 	if err != nil {
 		t.Fatal(err)
@@ -58,9 +86,11 @@ func TestChangeLogHeaderRestatedOnOldFormat(t *testing.T) {
 	cl.close()
 
 	b, _ := os.ReadFile(p)
-	text := string(b)
-	if !strings.Contains(text, old+changeLogHeader+"\n") {
-		t.Fatalf("new header must be restated right above new rows, got %q", text)
+	if !strings.HasPrefix(string(b), "\ufeff"+changeLogHeader+"\n") {
+		t.Errorf("fresh log must start with BOM+header: %q", string(b))
+	}
+	if strings.HasPrefix(string(b), "\ufeff\n") {
+		t.Errorf("fresh log must not start with a blank separator: %q", string(b))
 	}
 }
 

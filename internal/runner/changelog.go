@@ -22,8 +22,11 @@ type changeLog struct {
 
 const changeLogHeader = "Date\tAction\tSource\tResult\tSrcMB\tDstMB\tSavedMB\tSeconds\tKind\tFormat\tQuality\tComment"
 
-// openChangeLog appends to path (UTF-8 BOM + header written once so any
-// viewer shows Cyrillic correctly and the column names are visible).
+// openChangeLog appends to path. A brand-new file gets the UTF-8 BOM + header;
+// an existing file gets a blank separator line + a fresh header on every run,
+// so each run's rows sit under their own labeled section and the boundary
+// between runs is obvious when scrolling (the header always reflects the
+// current column layout too, so a format change is self-labeling).
 func openChangeLog(path string) (*changeLog, error) {
 	fresh := false
 	if _, err := os.Stat(path); err != nil {
@@ -36,29 +39,11 @@ func openChangeLog(path string) (*changeLog, error) {
 	cl := &changeLog{f: f, w: bufio.NewWriter(f)}
 	if fresh {
 		cl.w.WriteString("\ufeff" + changeLogHeader + "\n")
-	} else if !headerMatches(path) {
-		// Column layout changed between program versions (bytes became MB,
-		// a Seconds column was added): restate the header exactly where the
-		// new-style rows begin so nobody misreads MB rows as byte rows.
-		cl.w.WriteString(changeLogHeader + "\n")
+	} else {
+		cl.w.WriteString("\n" + changeLogHeader + "\n")
 	}
 	_ = cl.w.Flush()
 	return cl, nil
-}
-
-// headerMatches reports whether the existing log's first line already uses the
-// current column layout.
-func headerMatches(path string) bool {
-	f, err := os.Open(path)
-	if err != nil {
-		return true // unreadable: don't risk duplicating the header
-	}
-	defer f.Close()
-	line, err := bufio.NewReader(f).ReadString('\n')
-	if err != nil && line == "" {
-		return true
-	}
-	return strings.TrimRight(strings.TrimPrefix(line, "\ufeff"), "\r\n") == changeLogHeader
 }
 
 // record writes one audit row. Tab/newline chars in fields are flattened so

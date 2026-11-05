@@ -223,12 +223,13 @@ func (r *Runner) Run(ctx context.Context) error {
 	r.total = len(files)
 	fmt.Printf("Files found: %d\n", r.total)
 
-	// Live single-line status (progress, savings, rate, ETA) in a real console;
-	// when output is redirected/piped, print a compact line every 1000 files so
-	// logs stay readable.
+	// Live status (progress, savings, ETA) in a real console; when output is
+	// redirected/piped, print a compact line every 1000 files so logs stay
+	// readable. dry-run forces single-line mode: its per-file lines stream
+	// through printBreak and a fixed-height block would only get in the way.
 	start := time.Now()
 	tty := isTerminal(os.Stdout)
-	r.multi = tty && vt.Enable(os.Stdout)
+	r.multi = tty && !r.cfg.DryRun && vt.Enable(os.Stdout)
 	r.firstDraw.Store(true)
 	statusStop := make(chan struct{})
 	var statusWg sync.WaitGroup
@@ -274,8 +275,17 @@ func (r *Runner) Run(ctx context.Context) error {
 	close(statusStop)
 	statusWg.Wait()
 	if r.multi && r.statusVis {
-		// cursor sits at the end of line 2: clear it, step up, clear line 1.
-		fmt.Print("\x1b[2K\r\x1b[1A\x1b[2K\r")
+		// cursor sits at the end of the block's last row: step up to the
+		// first row, then clear every row of the fixed-height block.
+		n := r.blockLines()
+		fmt.Printf("\x1b[%dA", n-1)
+		for i := 0; i < n; i++ {
+			fmt.Print("\x1b[2K")
+			if i < n-1 {
+				fmt.Print("\n")
+			}
+		}
+		fmt.Print("\r")
 	} else if tty && !r.multi {
 		fmt.Print("\r" + strings.Repeat(" ", 110) + "\r")
 	}
@@ -286,12 +296,13 @@ func (r *Runner) Run(ctx context.Context) error {
 	return nil
 }
 
-// printStatus renders the live status (TTY mode). Labels are kept
-// terse/ASCII so the line stays readable regardless of the console codepage.
-// With VT available it is a two-line block: counters, then the files every
-// worker is on right now (name + elapsed) and the file that finished last.
-// Percent is TRUNCATED (not rounded): 46422/46423 shows 99%, never a fake
-// 100% while workers are still crunching.
+// printStatus renders the live status (TTY mode). Labels stay terse/ASCII for
+// codepage safety. With VT it is a FIXED-HEIGHT block so nothing jumps: a
+// counter header, one row per worker slot (elapsed time in a fixed column
+// first, then the relative path — paths are not clipped unless they would
+// exceed the console width and wrap, which would corrupt the cursor math),
+// then a last-finished row. Percent is TRUNCATED so it never reads 100% while
+// any worker still runs.
 func (r *Runner) printStatus(start time.Time) {
 	r.statusMu.Lock()
 	defer r.statusMu.Unlock()
@@ -309,22 +320,90 @@ func (r *Runner) printStatus(start time.Time) {
 	if doneB > 0 && scanB > doneB {
 		eta = fmtDur(time.Duration(float64(el) * float64(scanB-doneB) / float64(doneB)))
 	}
-	line := fmt.Sprintf("[%s] %d/%d (%d%%)  ok:%d already:%d nofit:%d ext:%d err:%d  |  saved %.0f MB  |  ETA %s",
+	header := fmt.Sprintf("[%s] %d/%d (%d%%)  ok:%d already:%d nofit:%d ext:%d err:%d  |  saved %.0f MB  |  ETA %s",
 		fmtDur(el), done, r.total, pct,
 		r.processed.Load(), r.skipDone.Load(), r.skipNotSmaller.Load(),
 		r.fixedExt.Load(), r.errored.Load(),
 		savedMB, eta)
 	if !r.multi {
-		fmt.Print("\r" + fmt.Sprintf("%-110s", line))
+		fmt.Print("\r" + fmt.Sprintf("%-110s", header))
 		return
 	}
-	work := r.activeLine()
+
+	width := vt.Width(os.Stdout)
+	if width <= 0 {
+		width = 100 // unknown console: stay narrow so a row never wraps
+	}
+	lines := r.statusBlock(clip(header, width-4), width-1)
+	n := len(lines)
 	if r.firstDraw.Swap(false) {
-		fmt.Printf("%-110s\n\x1b[2K\r%-110s", line, work)
+		for i, ln := range lines {
+			if i > 0 {
+				fmt.Print("\n")
+			}
+			fmt.Print(ln)
+		}
 	} else {
-		fmt.Print("\x1b[1A\x1b[2K\r" + fmt.Sprintf("%-110s\n\x1b[2K\r%-110s", line, work))
+		// cursor sits at the end of the previous block's last row: step up to
+		// the first row, then clear+rewrite each row in place.
+		fmt.Printf("\x1b[%dA", n-1)
+		for i, ln := range lines {
+			if i > 0 {
+				fmt.Print("\n")
+			}
+			fmt.Print("\x1b[2K\r" + ln)
+		}
 	}
 	r.statusVis = true
+}
+
+// statusBlock builds the fixed-height live block: header + one row per worker
+// slot (always r.cfg.Workers rows, idle slots show dashes) + a last-done row.
+// maxw clips a row to the console width (rune-safe) so it never wraps.
+func (r *Runner) statusBlock(header string, maxw int) []string {
+	workers := r.cfg.Workers
+	if workers < 1 {
+		workers = 1
+	}
+	r.activeMu.Lock()
+	jobs := make([]activeJob, len(r.active))
+	copy(jobs, r.active)
+	last, lastDur := r.lastDone, r.lastDur
+	r.activeMu.Unlock()
+
+	lines := make([]string, 0, workers+2)
+	lines = append(lines, header)
+	// clip budget leaves room for clip's ellipsis so the row (with "...")
+	// still fits the console width and never wraps.
+	clipw := maxw - 3
+	if clipw < 8 {
+		clipw = 8
+	}
+	now := time.Now()
+	for i := 0; i < workers; i++ {
+		if i < len(jobs) {
+			j := jobs[i]
+			lines = append(lines, clip(fmt.Sprintf("%2d  %5ds  %s", i+1, int(now.Sub(j.start).Seconds()), j.rel), clipw))
+		} else {
+			lines = append(lines, fmt.Sprintf("%2d  %5s", i+1, "--"))
+		}
+	}
+	if last != "" {
+		lines = append(lines, clip(fmt.Sprintf("last  %5.1fs  %s", lastDur.Seconds(), last), clipw))
+	} else {
+		lines = append(lines, "last    --")
+	}
+	return lines
+}
+
+// blockLines is the fixed row count of the live block for the current worker
+// count (header + workers slots + last-done row).
+func (r *Runner) blockLines() int {
+	w := r.cfg.Workers
+	if w < 1 {
+		w = 1
+	}
+	return w + 2
 }
 
 // trackStart/trackEnd maintain the live list of in-flight files (only when
@@ -352,34 +431,6 @@ func (r *Runner) trackEnd(path string, dur time.Duration) {
 	}
 	r.lastDone, r.lastDur = rel, dur
 	r.activeMu.Unlock()
-}
-
-// activeLine names the in-flight files (base name + elapsed seconds) and the
-// file that finished most recently (base name + how long it took).
-func (r *Runner) activeLine() string {
-	r.activeMu.Lock()
-	parts := make([]string, 0, len(r.active))
-	for _, a := range r.active {
-		parts = append(parts, fmt.Sprintf("%s %ds", clip(filepath.Base(a.rel), 40), int(time.Since(a.start).Seconds())))
-	}
-	last, lastDur := r.lastDone, r.lastDur
-	r.activeMu.Unlock()
-
-	line := "now: "
-	switch {
-	case len(parts) == 0:
-		line += "--"
-	default:
-		joined := strings.Join(parts, " | ")
-		if joined = clip(joined, 92); len(parts) > 1 && strings.HasSuffix(joined, "...") {
-			joined += fmt.Sprintf(" +%d more", len(parts)-1)
-		}
-		line += joined
-	}
-	if last != "" {
-		line += fmt.Sprintf("  |  last: %s %.1fs", clip(filepath.Base(last), 40), lastDur.Seconds())
-	}
-	return clip(line, 110) // never exceed the repaint width: a wrap would break the cursor math
 }
 
 // clip truncates s to max bytes on a UTF-8 rune boundary (names in the
@@ -1017,24 +1068,35 @@ func logf(cfg *config.Config, format string, v ...any) {
 	}
 }
 
-// r.logf logs an anomaly (console/log) AND mirrors it into the change log so
-// a double-click run keeps its full error trail on disk.
+// r.logf logs an anomaly AND mirrors it into the change log so a double-click
+// run keeps its full error trail on disk. In VT live-block mode the console
+// write is MUTED: an error line would corrupt/scroll the fixed block. The err
+// counter in the header and the journal (path printed at startup) carry every
+// error instead. In single-line/pipe mode errors still print to stderr — there
+// the is no live block to protect and stderr is the only channel.
 func (r *Runner) logf(format string, v ...any) {
-	r.printBreak(func() { logf(r.cfg, format, v...) })
+	if !r.multi {
+		r.printBreak(func() { logf(r.cfg, format, v...) })
+	}
 	r.changes.record("error", "", "", 0, 0, 0, "", "", "", fmt.Sprintf(format, v...))
 }
 
-// printBreak safely emits a one-off console message (error, dry-run line)
-// while the two-line live status is up: erase the live block, print the
-// message as its own permanent line, force the next status repaint to start
-// fresh below it. Without this, stderr writes would corrupt the VT cursor
-// bookkeeping and smear the status block.
+// printBreak safely emits a one-off console message (dry-run line, etc.) while
+// the live block is up: erase the block, print the message on its own line,
+// force the next repaint to start fresh below it. Without this, a raw write
+// would corrupt the VT cursor bookkeeping and smear the block.
 func (r *Runner) printBreak(print func()) {
 	r.statusMu.Lock()
-	if r.multi {
-		if r.statusVis { // two-line block on screen: erase it before the message
-			fmt.Print("\x1b[2K\r\x1b[1A\x1b[2K\r")
+	if r.statusVis {
+		n := r.blockLines()
+		fmt.Printf("\x1b[%dA", n-1)
+		for i := 0; i < n; i++ {
+			fmt.Print("\x1b[2K")
+			if i < n-1 {
+				fmt.Print("\n")
+			}
 		}
+		fmt.Print("\r")
 		r.statusVis = false
 		r.firstDraw.Store(true)
 	}
