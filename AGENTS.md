@@ -51,8 +51,9 @@
 - **`exiftool`** (exe + дерево `exiftool_files/` с Perl) — **встроен** (структура дерева обязательна!).
 - **`ffmpeg`** (видео/AV1) — **встроен** (gyan.dev **full_build**, статика ~228 МБ; `libsvtav1` +
   `libaom-av1` + GPU-AV1; exe ~300 МБ). **`ffprobe` не нужен**: код его не вызывает (роль играют
-  `-map 0:a?` + фолбек `-c:a aac`) — не встраивать и не резолвить. Если в ffmpeg нет `libsvtav1`,
-  `BuildVideoChain` по пробену `-encoders` честно деградирует в `libaom-av1` (тест `TestBuildVideoChain`).
+  `-map 0:a?` + фолбек `-c:a aac`) — не встраивать и не резолвить. Цепочка AV1 строится по
+  **реальному пробену** (`ProbeAV1Encoders`: 2 синтетических кадра на каждый энкодер при старте;
+  числиться в `-encoders` мало — нужно живое железо), плюс честная деградация svt→aom (`TestBuildVideoChain`).
 - Бинарники в `internal/assets/tools/windows/` **не коммитить** (gitignore), но они должны лежать на
   диске перед `go build`, иначе не встраиваются. Скачивать: avifenc — GitHub Releases AOMediaCodec/libavif
   (`windows-artifacts.zip`, статический); exiftool — SourceForge (BITS/`Start-BitsTransfer` обходит JS-заглушку;
@@ -80,6 +81,8 @@
 
 ## Стиль
 
+- **Весь текст программы (интерфейс, ошибки, журнал) — только английский**; никаких
+  декоративных скобок в выводах; в статусе нет МБ/с (метрика удалена по требованию юзера).
 - Идиоматичный Go: `context.Context` на всех долгих операциях и внешних процессах;
   параллелим `errgroup.SetLimit(workers)`; ошибки оборачивать `fmt.Errorf("...: %w", err)`;
   `database/sql` + `modernc.org/sqlite`.

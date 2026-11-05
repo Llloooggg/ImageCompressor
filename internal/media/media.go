@@ -13,6 +13,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Llloooggg/ImageCompressor/internal/tools"
 )
@@ -295,8 +296,14 @@ func CRFLadder(base int) []int {
 	return levels
 }
 
-// AvailableEncoders probes ffmpeg for AV1 encoders. Returns codec->available.
-func AvailableEncoders(ctx context.Context, loc *tools.Locator) map[string]bool {
+// ProbeAV1Encoders returns codec->usable by ACTUALLY encoding 2 synthetic
+// frames with each AV1 encoder that the ffmpeg build lists. Compile-time
+// presence (-encoders) is not enough: nvenc/amf/qsv can be built in while the
+// GPU lacks AV1 encode support or vendor runtime, and then fail on every file
+// mid-run. One real probe per encoder at startup (before workers start) is
+// decisive and costs ~2-4s total. Per-file fallback ordering stays as the
+// safety net for failures that only appear under load/driver hiccups.
+func ProbeAV1Encoders(ctx context.Context, loc *tools.Locator) map[string]bool {
 	avail := map[string]bool{}
 	ff := loc.FFmpeg()
 	if ff == "" {
@@ -306,8 +313,27 @@ func AvailableEncoders(ctx context.Context, loc *tools.Locator) map[string]bool 
 	if err != nil {
 		return avail
 	}
-	for _, codec := range []string{"av1_nvenc", "av1_amf", "av1_qsv", "libsvtav1", "libaom-av1"} {
-		if strings.Contains(string(out), codec) {
+	// Probe args mirror what buildChain bakes in (vendor rc/quality must be
+	// valid for the probe to be fair); fast settings to keep startup cheap.
+	probeArgs := map[string][]string{
+		"av1_nvenc":  {"-cq", "28"},
+		"av1_amf":    {"-rc", "cqp", "-qp_i", "28", "-qp_p", "28"},
+		"av1_qsv":    {"-global_quality", "28"},
+		"libsvtav1":  {"-crf", "30"},
+		"libaom-av1": {"-crf", "30", "-cpu-used", "9"},
+	}
+	for codec, q := range probeArgs {
+		if !strings.Contains(string(out), codec) {
+			continue // not even in the build
+		}
+		pctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		args := append([]string{"-hide_banner", "-loglevel", "error", "-f", "lavfi",
+			"-i", "testsrc=s=320x240:r=24", "-frames:v", "2", "-pix_fmt", "yuv420p",
+			"-c:v", codec}, q...)
+		args = append(args, "-f", "null", "-")
+		_, err := loc.Run(pctx, ff, args...)
+		cancel()
+		if err == nil {
 			avail[codec] = true
 		}
 	}

@@ -12,7 +12,7 @@ import (
 // changeLog is an append-only audit log next to the DB: what was converted
 // into what, size before/after, achieved quality. Plain text, columns split by
 // tabs (opens fine in Notepad; Excel can too, but nothing depends on it).
-// One row per mutation (сжат / не уменьшился / исправлено расширение / ошибка).
+// One row per mutation (compressed / not smaller / ext renamed / error).
 // Rows are flushed immediately so the log survives even a process kill.
 type changeLog struct {
 	mu sync.Mutex
@@ -20,7 +20,7 @@ type changeLog struct {
 	w  *bufio.Writer
 }
 
-const changeLogHeader = "Дата\tДействие\tИсходник\tРезультат\tБыло,байт\tСтало,байт\tЭкономия,байт\tТип\tФормат\tКачество\tКомментарий"
+const changeLogHeader = "Date\tAction\tSource\tResult\tSrcBytes\tDstBytes\tSavedBytes\tKind\tFormat\tQuality\tComment"
 
 // openChangeLog appends to path (UTF-8 BOM + header written once so any
 // viewer shows Cyrillic correctly and the column names are visible).

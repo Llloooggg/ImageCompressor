@@ -148,7 +148,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		} else {
 			r.changes = cl
 			defer cl.close()
-			fmt.Printf("Журнал: %s\n", p)
+			fmt.Printf("Log: %s\n", p)
 		}
 	}
 
@@ -161,16 +161,16 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 
 	// Probe AV1 encoders once and resolve the GPU->CPU fallback chain.
-	avail := media.AvailableEncoders(ctx, r.loc)
+	avail := media.ProbeAV1Encoders(ctx, r.loc)
 	r.vchain = r.opts.BuildVideoChain(avail)
-	fmt.Printf("Видео-кодировщик (режим %q): %s\n", r.opts.Encoder, chainString(r.vchain))
+	fmt.Printf("Video encoders, mode %q: %s\n", r.opts.Encoder, chainString(r.vchain))
 
 	files, err := r.gather(ctx)
 	if err != nil {
 		return err
 	}
 	r.total = len(files)
-	fmt.Printf("Найдено файлов: %d\n", r.total)
+	fmt.Printf("Files found: %d\n", r.total)
 
 	// Live single-line status (progress, savings, rate, ETA) in a real console;
 	// when output is redirected/piped, print a compact line every 1000 files so
@@ -209,7 +209,7 @@ func (r *Runner) Run(ctx context.Context) error {
 			if tty {
 				r.printStatus(start)
 			} else if n%1000 == 0 {
-				fmt.Printf("Обработка: %d/%d\n", n, r.total)
+				fmt.Printf("Processed: %d/%d\n", n, r.total)
 			}
 			return nil
 		})
@@ -237,10 +237,6 @@ func (r *Runner) printStatus(start time.Time) {
 	}
 	el := time.Since(start)
 	savedMB := float64(r.origBytes.Load()-r.newBytes.Load()) / (1024 * 1024)
-	rate := 0.0
-	if el.Seconds() > 0 {
-		rate = savedMB / el.Seconds()
-	}
 	// ETA from scanned bytes already accounted for (file-count ETA is skewed
 	// by instant skip-hits; bytes track real work much better).
 	eta := "--:--:--"
@@ -248,11 +244,11 @@ func (r *Runner) printStatus(start time.Time) {
 	if doneB > 0 && scanB > doneB {
 		eta = fmtDur(time.Duration(float64(el) * float64(scanB-doneB) / float64(doneB)))
 	}
-	line := fmt.Sprintf("[%s] %d/%d (%.0f%%)  ok:%d done:%d nofit:%d ext:%d err:%d  |  saved %.0f MB (%.1f MB/s)  |  ETA %s",
+	line := fmt.Sprintf("[%s] %d/%d (%.0f%%)  ok:%d done:%d nofit:%d ext:%d err:%d  |  saved %.0f MB  |  ETA %s",
 		fmtDur(el), done, r.total, pct,
 		r.processed.Load(), r.skipDone.Load(), r.skipNotSmaller.Load(),
 		r.fixedExt.Load(), r.errored.Load(),
-		savedMB, rate, eta)
+		savedMB, eta)
 	fmt.Print("\r" + fmt.Sprintf("%-110s", line))
 }
 
@@ -509,7 +505,7 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 		r.skipNotSmaller.Add(1)
 		r.addSize(path, path)
 		_ = r.store.MarkNoChange(ctx, srcHash, rel, res.Kind.String(), mediaFormatFor(res, finalPath), toolSelf, toolVersion, r.stampFor(res.Kind))
-		r.changes.record("не уменьшился", rel, rel, origSize, origSize, res.Kind.String(), mediaFormatFor(res, finalPath), "", "")
+		r.changes.record("not smaller", rel, rel, origSize, origSize, res.Kind.String(), mediaFormatFor(res, finalPath), "", "")
 		r.ensureHonestExt(path, res)
 		return
 	}
@@ -525,7 +521,7 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 		if !errors.Is(err, meta.ErrNoExiftool) {
 			r.logf("meta %s: %v", rel, err)
 		} else {
-			r.logf("meta: exiftool не найден — метаданные могут потеряться: %s", rel)
+			r.logf("meta: exiftool not found, metadata may be lost: %s", rel)
 		}
 	}
 	// Restore original filesystem times before the swap.
@@ -553,7 +549,7 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 		r.skipNotSmaller.Add(1)
 		r.addSize(path, path)
 		_ = r.store.MarkNoChange(ctx, srcHash, rel, res.Kind.String(), mediaFormatFor(res, finalPath), toolSelf, toolVersion, r.stampFor(res.Kind))
-		r.changes.record("не уменьшился", rel, rel, origInfo.Size(), newInfo.Size(), res.Kind.String(), mediaFormatFor(res, finalPath), "", "")
+		r.changes.record("not smaller", rel, rel, origInfo.Size(), newInfo.Size(), res.Kind.String(), mediaFormatFor(res, finalPath), "", "")
 		r.ensureHonestExt(path, res)
 		return
 	}
@@ -609,7 +605,7 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 	if origInfo != nil {
 		srcSize = origInfo.Size()
 	}
-	r.changes.record("сжат", rel, newRel, srcSize, dstSize, res.Kind.String(), mediaFormatFor(res, finalPath), achieved, "")
+	r.changes.record("compressed", rel, newRel, srcSize, dstSize, res.Kind.String(), mediaFormatFor(res, finalPath), achieved, "")
 	if finalPath != path {
 		safefs.RemoveIfExists(path)
 	}
@@ -640,7 +636,7 @@ func (r *Runner) ensureHonestExt(path string, res detect.Result) {
 		return
 	}
 	if fileExists(newPath) {
-		r.logf("fix-ext %s: цель %s уже существует — имя не меняем", r.rel(path), r.rel(newPath))
+		r.logf("fix-ext %s: target %s already exists, keeping name", r.rel(path), r.rel(newPath))
 		return
 	}
 	var sz int64
@@ -653,7 +649,7 @@ func (r *Runner) ensureHonestExt(path string, res detect.Result) {
 		return
 	}
 	r.fixedExt.Add(1)
-	r.changes.record("исправлено расширение", r.rel(path), r.rel(newPath), sz, sz, res.Kind.String(), honest, "", "")
+	r.changes.record("ext renamed", r.rel(path), r.rel(newPath), sz, sz, res.Kind.String(), honest, "", "")
 }
 
 func (r *Runner) fixExtOnly(path string, res detect.Result) {
@@ -727,8 +723,8 @@ func (r *Runner) Summary() string {
 		pct = (1 - nb/ob) * 100
 	}
 	return fmt.Sprintf(
-		"Готово. Сжато/заменено: %d, уже обработано: %d, не уменьшилось: %d, исправлено расширений: %d, не-медиа: %d, ошибок: %d\n"+
-			"Размер: %.2f MB -> %.2f MB (%.2f%%)",
+		"Done. Compressed: %d, already processed: %d, not smaller: %d, extensions fixed: %d, non-media: %d, errors: %d\n"+
+			"Size: %.2f MB -> %.2f MB = %.2f%% saved",
 		r.processed.Load(), r.skipDone.Load(), r.skipNotSmaller.Load(), r.fixedExt.Load(), r.skipUnknown.Load(), r.errored.Load(),
 		ob, nb, pct,
 	)
@@ -737,7 +733,7 @@ func (r *Runner) Summary() string {
 func chainString(v media.VideoChain) string {
 	c := v.Codecs()
 	if len(c) == 0 {
-		return "нет доступного AV1-кодировщика (проверь ffmpeg/драйверы)"
+		return "no usable AV1 encoder, check ffmpeg/drivers"
 	}
 	return strings.Join(c, " -> ")
 }
@@ -840,7 +836,7 @@ func logf(cfg *config.Config, format string, v ...any) {
 // a double-click run keeps its full error trail on disk.
 func (r *Runner) logf(format string, v ...any) {
 	logf(r.cfg, format, v...)
-	r.changes.record("ошибка", "", "", 0, 0, "", "", "", fmt.Sprintf(format, v...))
+	r.changes.record("error", "", "", 0, 0, "", "", "", fmt.Sprintf(format, v...))
 }
 
 // achievedFor renders the actual result quality stored in the DB ("achieved"
