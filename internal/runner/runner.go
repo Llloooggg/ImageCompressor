@@ -13,6 +13,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -53,14 +54,41 @@ type Runner struct {
 
 func New(cfg *config.Config, st *store.Store, loc *tools.Locator) *Runner {
 	return &Runner{
-		cfg:        cfg,
-		store:      st,
-		loc:        loc,
-		opts:       media.Opts{PhotoQ: cfg.PhotoQ, PhotoLoss: cfg.PhotoLoss, PhotoVMAFMin: cfg.PhotoVMAF, VideoCRF: cfg.VideoCRF, VideoVMAFMin: cfg.VideoVMAF, Encoder: cfg.VideoEnc},
+		cfg:   cfg,
+		store: st,
+		loc:   loc,
+		opts: media.Opts{
+			PhotoQ:       cfg.PhotoQ,
+			PhotoLoss:    cfg.PhotoLoss,
+			PhotoSpeed:   cfg.PhotoSpeed,
+			PhotoVMAFMin: cfg.PhotoVMAF,
+			VideoCRF:     cfg.VideoCRF,
+			VideoVMAFMin: cfg.VideoVMAF,
+			Encoder:      cfg.VideoEnc,
+			// Auto core split: every child encoder/vmaf gets its slice instead
+			// of greedily grabbing all cores (N workers × all-cores children just
+			// thrash each other). Thread count does NOT change encoder output
+			// (aom/svt/libvmaf are thread-deterministic), so the nochange
+			// stamps deliberately exclude it.
+			CPUBudget: childBudget(cfg.Workers),
+		},
 		exif:       loc.Exiftool(),
 		hasAvifenc: loc.Avifenc() != "",
 		hasFFmpeg:  loc.FFmpeg() != "",
 	}
+}
+
+// childBudget = cores per worker (floor 1): the auto-computed slice of the
+// machine granted to each parallel encoder job.
+func childBudget(workers int) int {
+	if workers < 1 {
+		workers = 1
+	}
+	t := runtime.NumCPU() / workers
+	if t < 1 {
+		t = 1
+	}
+	return t
 }
 
 // stampFor fingerprints the settings that decide "can this shrink?". A nochange

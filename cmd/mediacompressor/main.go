@@ -39,11 +39,12 @@ func main() {
 	// even a hard kill cannot corrupt anything.
 	go func() {
 		<-ctx.Done()
+		fmt.Println("\nStopping: running files finish safely, no new files start. Press Ctrl+C again to exit immediately.")
 		ch := make(chan os.Signal, 1)
 		signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
 		defer signal.Stop(ch)
 		<-ch
-		fmt.Println("\nHard stop. Next run resumes where this one left off.")
+		fmt.Println("Hard stop. Next run resumes where this one left off.")
 		os.Exit(1)
 	}()
 

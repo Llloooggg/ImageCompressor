@@ -81,6 +81,34 @@ func TestPhotoLadder(t *testing.T) {
 	}
 }
 
+// CPU encoder calls must carry the per-child thread slice; GPU encoders must not.
+func TestVideoFFArgsThreads(t *testing.T) {
+	svt := cand{"libsvtav1", "-crf", "28"}
+	aom := cand{"libaom-av1", "-crf", "28"}
+	nv := cand{"av1_nvenc", "-cq", "28"}
+
+	has := func(args []string, pair ...string) bool {
+		for i := 0; i+1 < len(args); i++ {
+			if args[i] == pair[0] && args[i+1] == pair[1] {
+				return true
+			}
+		}
+		return false
+	}
+	if a := videoFFArgs(svt, []string{"-c:a", "copy"}, 4, "s", "t"); !has(a, "-svtav1-params", "lp=4") {
+		t.Errorf("svt call missing lp budget: %v", a)
+	}
+	if a := videoFFArgs(aom, []string{"-c:a", "copy"}, 4, "s", "t"); !has(a, "-threads", "4") {
+		t.Errorf("libaom call missing thread cap: %v", a)
+	}
+	if a := videoFFArgs(nv, []string{"-c:a", "copy"}, 4, "s", "t"); has(a, "-threads", "4") || has(a, "-svtav1-params", "lp=4") {
+		t.Errorf("nvenc call must not carry CPU thread flags: %v", a)
+	}
+	if a := videoFFArgs(svt, []string{"-c:a", "copy"}, 0, "s", "t"); has(a, "-svtav1-params", "lp=0") {
+		t.Errorf("threads=0 must leave codec default: %v", a)
+	}
+}
+
 func TestWithCRFRebuild(t *testing.T) {
 	avail := map[string]bool{"av1_nvenc": true, "libsvtav1": true}
 	ch := Opts{VideoCRF: 28, Encoder: EncAuto}.BuildVideoChain(avail)

@@ -36,10 +36,12 @@ const (
 type Opts struct {
 	PhotoQ       int     // 0..100
 	PhotoLoss    bool    // pixel-exact AVIF
+	PhotoSpeed   int     // avifenc --speed 0..10 (higher = faster, bigger; 6 = canon)
 	PhotoVMAFMin float64 // min acceptable VMAF for ESCALATED photo levels (0 disables the guard)
 	VideoCRF     int     // CRF floor of the ladder (escalation +6/+12, capped at 45)
 	VideoVMAFMin float64 // min acceptable VMAF for ESCALATED levels (0 disables the guard)
 	Encoder      string
+	CPUBudget    int // threads granted to each child encoder/vmaf (0 = codec default)
 }
 
 // PhotoResult reports what EncodeImage actually achieved when it kept a temp:
@@ -97,7 +99,7 @@ func EncodeImage(ctx context.Context, loc *tools.Locator, o Opts, src, tmp strin
 		if ff == "" {
 			return -1 // no ffmpeg for the metric: honest fallback (do not block)
 		}
-		return vmafScore(ctx, loc, ff, tmp, src)
+		return vmafScore(ctx, loc, ff, tmp, src, o.CPUBudget)
 	}
 
 	if o.PhotoLoss {
@@ -170,11 +172,14 @@ func EncodeImage(ctx context.Context, loc *tools.Locator, o Opts, src, tmp strin
 // ffmpeg. Same tool-quirk handling as the old single-shot EncodeImage.
 func encodeImageAt(ctx context.Context, loc *tools.Locator, o Opts, q int, src, tmp string) error {
 	if a := loc.Avifenc(); a != "" {
-		args := []string{"--speed", "6"}
+		args := []string{"--speed", strconv.Itoa(clamp(o.PhotoSpeed, 0, 10))}
 		if o.PhotoLoss {
 			args = append(args, "--lossless")
 		} else {
 			args = append(args, "-q", strconv.Itoa(clamp(q, 0, 100)))
+		}
+		if o.CPUBudget > 0 {
+			args = append(args, "-j", strconv.Itoa(o.CPUBudget)) // share cores across workers
 		}
 		args = append(args, src, tmp)
 		if err := run(loc, a, args...); err == nil {
@@ -199,8 +204,11 @@ func encodeImageFFmpeg(ctx context.Context, loc *tools.Locator, o Opts, q int, s
 		"-crf", strconv.Itoa(aomCRFFromQ(q, o.PhotoLoss)),
 		"-pix_fmt", "yuv420p",
 		"-map_metadata", "-1",
-		tmp,
 	}
+	if o.CPUBudget > 0 {
+		args = append(args, "-threads", strconv.Itoa(o.CPUBudget))
+	}
+	args = append(args, tmp)
 	return run(loc, ff, args...)
 }
 
@@ -208,11 +216,14 @@ func encodeImageFFmpeg(ctx context.Context, loc *tools.Locator, o Opts, q int, s
 // Tries avifenc first (best animated AVIF; reads GIF natively), then ffmpeg.
 func EncodeAnimated(ctx context.Context, loc *tools.Locator, o Opts, src, tmp string) error {
 	if a := loc.Avifenc(); a != "" {
-		args := []string{"--speed", "6"}
+		args := []string{"--speed", strconv.Itoa(clamp(o.PhotoSpeed, 0, 10))}
 		if o.PhotoLoss {
 			args = append(args, "--lossless")
 		} else {
 			args = append(args, "-q", strconv.Itoa(clamp(o.PhotoQ, 0, 100)))
+		}
+		if o.CPUBudget > 0 {
+			args = append(args, "-j", strconv.Itoa(o.CPUBudget))
 		}
 		args = append(args, src, tmp)
 		if err := run(loc, a, args...); err == nil {
@@ -232,8 +243,11 @@ func EncodeAnimated(ctx context.Context, loc *tools.Locator, o Opts, src, tmp st
 		"-crf", strconv.Itoa(aomCRFFromQ(o.PhotoQ, o.PhotoLoss)),
 		"-pix_fmt", "yuv420p",
 		"-map_metadata", "-1",
-		tmp,
 	}
+	if o.CPUBudget > 0 {
+		args = append(args, "-threads", strconv.Itoa(o.CPUBudget))
+	}
+	args = append(args, tmp)
 	if err := run(loc, ff, args...); err != nil {
 		return fmt.Errorf("animated AVIF failed (avifenc + ffmpeg tried): %w", err)
 	}
@@ -424,7 +438,7 @@ func EncodeVideo(ctx context.Context, loc *tools.Locator, o Opts, chain VideoCha
 
 	attempt := func(ch VideoChain, audioArgs []string) (kept, ran bool, lastErr error) {
 		for _, c := range ch.cands {
-			args := videoFFArgs(c, audioArgs, src, tmp)
+			args := videoFFArgs(c, audioArgs, o.CPUBudget, src, tmp)
 			if err := run(loc, ff, args...); err != nil {
 				lastErr = fmt.Errorf("%s: %w", c.codec, err)
 				os.Remove(tmp)
@@ -450,7 +464,7 @@ func EncodeVideo(ctx context.Context, loc *tools.Locator, o Opts, chain VideoCha
 				if i == 0 || o.VideoVMAFMin <= 0 {
 					return true, VideoResult{CRF: lvl, VMAF: -1}, true, nil // base level: user's order; or guard disabled
 				}
-				score := vmafScore(ctx, loc, ff, tmp, src)
+				score := vmafScore(ctx, loc, ff, tmp, src, o.CPUBudget)
 				if score < 0 || score >= o.VideoVMAFMin {
 					return true, VideoResult{CRF: lvl, VMAF: score}, true, nil // passed the floor (libvmaf missing -> honest fallback)
 				}
@@ -472,7 +486,7 @@ func EncodeVideo(ctx context.Context, loc *tools.Locator, o Opts, chain VideoCha
 						lo = mid // still not smaller: push crf up
 						continue
 					}
-					s2 := vmafScore(ctx, loc, ff, tmp, src)
+					s2 := vmafScore(ctx, loc, ff, tmp, src, o.CPUBudget)
 					if s2 < 0 || s2 >= o.VideoVMAFMin {
 						return true, VideoResult{CRF: mid, VMAF: s2}, true, nil // both smaller and imperceptible
 					}
@@ -519,12 +533,17 @@ func EncodeVideo(ctx context.Context, loc *tools.Locator, o Opts, chain VideoCha
 
 // vmafScore scores candidate against the original file (reference) with
 // libvmaf. Works for videos and single frames (stills). >=95 was measured on
-// this archive as "difference invisible to the eye". Returns -1 when libvmaf
-// is unavailable or the pass failed — callers must not block compression on a
-// metrics-tool hiccup (honest fallback).
-func vmafScore(ctx context.Context, loc *tools.Locator, ff, candidate, original string) float64 {
+// this archive as "difference invisible to the eye". threads caps libvmaf's
+// core use so parallel workers do not oversubscribe the machine. Returns -1
+// when libvmaf is unavailable or the pass failed — callers must not block
+// compression on a metrics-tool hiccup (honest fallback).
+func vmafScore(ctx context.Context, loc *tools.Locator, ff, candidate, original string, threads int) float64 {
+	filter := "libvmaf"
+	if threads > 0 {
+		filter = fmt.Sprintf("libvmaf=n_threads=%d", threads)
+	}
 	out, err := loc.Run(ctx, ff, "-hide_banner", "-i", candidate, "-i", original,
-		"-lavfi", "libvmaf", "-f", "null", "-")
+		"-lavfi", filter, "-f", "null", "-")
 	if err != nil {
 		return -1
 	}
@@ -541,7 +560,9 @@ func vmafScore(ctx context.Context, loc *tools.Locator, ff, candidate, original 
 }
 
 // videoFFArgs assembles an ffmpeg command for one video candidate + audio args.
-func videoFFArgs(c cand, audioArgs []string, src, tmp string) []string {
+// threads grants each CPU encoder its slice of the core pool (0 = codec
+// default). GPU encoders (nvenc/amf/qsv) ignore it.
+func videoFFArgs(c cand, audioArgs []string, threads int, src, tmp string) []string {
 	args := []string{
 		"-y", "-i", src,
 		"-map", "0:v:0",
@@ -549,6 +570,16 @@ func videoFFArgs(c cand, audioArgs []string, src, tmp string) []string {
 		"-c:v", c.codec,
 	}
 	args = append(args, splitQuality(c.flag, c.value)...)
+	switch c.codec {
+	case "libsvtav1":
+		if threads > 0 {
+			args = append(args, "-svtav1-params", fmt.Sprintf("lp=%d", threads))
+		}
+	case "libaom-av1":
+		if threads > 0 {
+			args = append(args, "-threads", strconv.Itoa(threads))
+		}
+	}
 	args = append(args, audioArgs...)
 	args = append(args,
 		"-movflags", "+faststart",

@@ -12,21 +12,22 @@ import (
 )
 
 type Config struct {
-	Input     string
-	Output    string  // empty == in-place (== Input)
-	Database  string  // empty == <Input>/image_compressor.db
-	PhotoQ    int     // AVIF quality 0..100
-	PhotoLoss bool    // force pixel-exact lossless AVIF
-	PhotoVMAF float64 // min VMAF for escalated photo q levels (0 disables the quality guard)
-	VideoCRF  int     // AV1 CRF floor (0..50); the tool auto-escalates per file (+6, +12) when it can't shrink
-	VideoVMAF float64 // min VMAF for escalated CRF levels (0 disables the quality guard)
-	VideoEnc  string  // auto|gpu|cpu|nvenc|amf|qsv|libaom (see media)
-	Workers   int
-	Migrate   bool // one-shot unify of legacy-python outputs
-	FixExt    bool // ONLY fix lying extensions (no compression); extensions are also always fixed during normal runs
-	DryRun    bool
-	Yes       bool // skip confirmation
-	Verbose   bool
+	Input      string
+	Output     string  // empty == in-place (== Input)
+	Database   string  // empty == <Input>/image_compressor.db
+	PhotoQ     int     // AVIF quality 0..100
+	PhotoLoss  bool    // force pixel-exact lossless AVIF
+	PhotoSpeed int     // avifenc speed 0..10, higher = faster/bigger (default 6 = best-size canon)
+	PhotoVMAF  float64 // min VMAF for escalated photo q levels (0 disables the quality guard)
+	VideoCRF   int     // AV1 CRF floor (0..50); the tool auto-escalates per file (+6, +12) when it can't shrink
+	VideoVMAF  float64 // min VMAF for escalated CRF levels (0 disables the quality guard)
+	VideoEnc   string  // auto|gpu|cpu|nvenc|amf|qsv|libaom (see media)
+	Workers    int
+	Migrate    bool // one-shot unify of legacy-python outputs
+	FixExt     bool // ONLY fix lying extensions (no compression); extensions are also always fixed during normal runs
+	DryRun     bool
+	Yes        bool // skip confirmation
+	Verbose    bool
 }
 
 // ExecDir returns the directory containing the running executable.
@@ -67,6 +68,7 @@ func Parse(args []string) (*Config, error) {
 	fs.IntVar(&c.PhotoQ, "photo-q", 85, "AVIF quality for photos, 0..100; if a photo cannot shrink, the tool lowers q by -6/-12 steps on its own")
 	fs.Float64Var(&c.PhotoVMAF, "photo-vmaf-min", 95, "min VMAF for lowered photo steps, vs original (0 = disable quality guard)")
 	fs.BoolVar(&c.PhotoLoss, "photo-lossless", false, "lossless AVIF, pixel-exact, larger")
+	fs.IntVar(&c.PhotoSpeed, "photo-speed", 6, "avifenc speed 0..10: higher = faster, slightly bigger files; 6 = best size (the canon, keep unless desperate)")
 	fs.IntVar(&c.VideoCRF, "video-crf", 28, "base AV1 CRF 0..50, lower = better/heavier; the tool raises it by +6/+12 steps when it cannot shrink")
 	fs.Float64Var(&c.VideoVMAF, "video-vmaf-min", 95, "min VMAF for raised CRF steps, vs original (0 = disable quality guard)")
 	fs.IntVar(&c.Workers, "workers", defWorkers, fmt.Sprintf("parallel workers (default %d)", defWorkers))
