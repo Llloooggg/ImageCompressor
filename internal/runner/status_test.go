@@ -48,26 +48,26 @@ func TestPrintStatusFixedBlock(t *testing.T) {
 	if !strings.Contains(out1, "(33%)") {
 		t.Errorf("expected truncated 33%% for 1/3, got %q", out1)
 	}
-	// fixed height: header + 2 idle worker slots + last row, all on first draw
-	if got := strings.Count(out1, "\n"); got != 3 {
-		t.Errorf("block must be 4 rows (3 newlines), got %d: %q", got, out1)
+	// fixed height: header + 2 idle worker slots, all on first draw
+	if got := strings.Count(out1, "\n"); got != 2 {
+		t.Errorf("block must be 3 rows (2 newlines), got %d: %q", got, out1)
 	}
 	if !strings.Contains(out1, "--") {
 		t.Errorf("idle worker slots must show dashes: %q", out1)
 	}
-	if !strings.Contains(out1, "last") {
-		t.Errorf("missing last-done row: %q", out1)
+	if strings.Contains(out1, "last") {
+		t.Errorf("last-done row was removed from the block: %q", out1)
 	}
 	if strings.Contains(out1, "\x1b[") {
 		t.Errorf("first draw must not move the cursor or clear: %q", out1)
 	}
 
 	out2 := captureStdout(t, func() { r.printStatus(time.Now()) })
-	if !strings.Contains(out2, "\x1b[3A") {
+	if !strings.Contains(out2, "\x1b[2A") {
 		t.Errorf("second repaint must step up blockLines-1 rows, got %q", out2)
 	}
-	if got := strings.Count(out2, "\x1b[2K"); got != 4 {
-		t.Errorf("repaint must clear every block row (%d), got %d: %q", 4, got, out2)
+	if got := strings.Count(out2, "\x1b[2K"); got != 3 {
+		t.Errorf("repaint must clear every block row (%d), got %d: %q", 3, got, out2)
 	}
 
 	// the battle bug: 46422/46423 rounded to "100%" while workers still ran
@@ -86,8 +86,8 @@ func TestStatusBlockSlots(t *testing.T) {
 	r.trackStart(`C:\arc\family\holiday.mp4`)
 	r.trackStart(`C:\arc\family\second very long file name with a lot of characters here.mp4`)
 	lines := r.statusBlock("hdr", 200)
-	if len(lines) != 4 {
-		t.Fatalf("want header + 2 slots + last row, got %d: %q", len(lines), lines)
+	if len(lines) != 3 {
+		t.Fatalf("want header + 2 slots, got %d: %q", len(lines), lines)
 	}
 	if !strings.Contains(lines[1], `family\holiday.mp4`) {
 		t.Errorf("slot 1 must show the relative path: %q", lines[1])
@@ -97,14 +97,13 @@ func TestStatusBlockSlots(t *testing.T) {
 		t.Errorf("elapsed time must precede the path: %q", lines[1])
 	}
 
-	r.trackEnd(`C:\arc\family\holiday.mp4`, 1200*time.Millisecond)
+	r.trackEnd(`C:\arc\family\holiday.mp4`)
 	lines = r.statusBlock("hdr", 200)
 	if strings.Contains(lines[1]+lines[2], "holiday.mp4") {
 		t.Errorf("finished file still in a worker slot: %q", lines)
 	}
-	last := lines[3]
-	if !strings.Contains(last, "1.2s") || !strings.Contains(last, `family\holiday.mp4`) {
-		t.Errorf("last row must show duration + relative path: %q", last)
+	if !strings.Contains(lines[2], "--") {
+		t.Errorf("freed slot must fall back to dashes: %q", lines)
 	}
 	// a slot row may never exceed the console width: long paths get clipped
 	// (clip's ellipsis counted: statusBlock budgets maxw-3 for it)

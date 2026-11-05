@@ -53,14 +53,12 @@ type Runner struct {
 	done                                                                atomic.Int64
 	total                                                               int
 
-	multi     bool        // VT two-line status: counters + live "what is running now" line
+	multi     bool        // VT fixed-height status block: counters + per-worker rows
 	firstDraw atomic.Bool // first VT repaint of this run
-	statusVis bool        // two-line block is currently on screen (guarded by statusMu)
+	statusVis bool        // live block is currently on screen (guarded by statusMu)
 	statusMu  sync.Mutex  // one repaint at a time (ticker goroutine vs workers)
 	activeMu  sync.Mutex
 	active    []activeJob // files the workers are chewing on right now
-	lastDone  string      // most recently finished file + its processing time
-	lastDur   time.Duration
 }
 
 // activeJob is one file a worker is processing right now, for the live
@@ -258,10 +256,9 @@ func (r *Runner) Run(ctx context.Context) error {
 			if gctx.Err() != nil {
 				return nil // stop requested: don't start new files
 			}
-			fileStart := time.Now()
 			r.trackStart(f)
 			r.process(gctx, f)
-			r.trackEnd(f, time.Since(fileStart))
+			r.trackEnd(f)
 			n := r.done.Add(1)
 			if tty {
 				r.printStatus(start)
@@ -358,8 +355,8 @@ func (r *Runner) printStatus(start time.Time) {
 }
 
 // statusBlock builds the fixed-height live block: header + one row per worker
-// slot (always r.cfg.Workers rows, idle slots show dashes) + a last-done row.
-// maxw clips a row to the console width (rune-safe) so it never wraps.
+// slot (always r.cfg.Workers rows, idle slots show dashes). maxw clips a row
+// to the console width (rune-safe) so it never wraps.
 func (r *Runner) statusBlock(header string, maxw int) []string {
 	workers := r.cfg.Workers
 	if workers < 1 {
@@ -368,10 +365,9 @@ func (r *Runner) statusBlock(header string, maxw int) []string {
 	r.activeMu.Lock()
 	jobs := make([]activeJob, len(r.active))
 	copy(jobs, r.active)
-	last, lastDur := r.lastDone, r.lastDur
 	r.activeMu.Unlock()
 
-	lines := make([]string, 0, workers+2)
+	lines := make([]string, 0, workers+1)
 	lines = append(lines, header)
 	// clip budget leaves room for clip's ellipsis so the row (with "...")
 	// still fits the console width and never wraps.
@@ -388,22 +384,17 @@ func (r *Runner) statusBlock(header string, maxw int) []string {
 			lines = append(lines, fmt.Sprintf("%2d  %5s", i+1, "--"))
 		}
 	}
-	if last != "" {
-		lines = append(lines, clip(fmt.Sprintf("last  %5.1fs  %s", lastDur.Seconds(), last), clipw))
-	} else {
-		lines = append(lines, "last    --")
-	}
 	return lines
 }
 
 // blockLines is the fixed row count of the live block for the current worker
-// count (header + workers slots + last-done row).
+// count (header + workers slots).
 func (r *Runner) blockLines() int {
 	w := r.cfg.Workers
 	if w < 1 {
 		w = 1
 	}
-	return w + 2
+	return w + 1
 }
 
 // trackStart/trackEnd maintain the live list of in-flight files (only when
@@ -417,7 +408,7 @@ func (r *Runner) trackStart(path string) {
 	r.activeMu.Unlock()
 }
 
-func (r *Runner) trackEnd(path string, dur time.Duration) {
+func (r *Runner) trackEnd(path string) {
 	if !r.multi {
 		return
 	}
@@ -429,7 +420,6 @@ func (r *Runner) trackEnd(path string, dur time.Duration) {
 			break
 		}
 	}
-	r.lastDone, r.lastDur = rel, dur
 	r.activeMu.Unlock()
 }
 
