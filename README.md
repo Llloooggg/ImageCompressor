@@ -155,7 +155,7 @@ Size: 8120.50 MB -> 5610.20 MB = 30.91% saved
 
 ```
 Date	Action	Source	Result	SrcMB	DstMB	SavedMB	Seconds	Kind	Format	Quality	Comment
-2026-11-05 02:55:57	compressed	svid.mp4	svid.mp4	0.027	0.026	0.001	8.5	video	mp4	svt crf=34 vmaf=97.2	svt crf28 nofit 3.9s; svt crf34 kept 4.2s; vmaf=97.2 guard 0.4s
+2026-11-05 02:55:57	compressed	svid.mp4	svid.mp4	0.027	0.026	0.001	8.5	video	mp4	svt p8 crf=34 vmaf=97.2	svt crf28 nofit 3.9s; svt crf34 kept 4.2s; vmaf=97.2 guard 0.4s
 2026-11-05 02:55:56	not smaller	liar.jpg	liar.jpg	0.000	0.000	0.000	1.2	image	avif		avifenc q85 nofit 0.4s; avifenc q79 nofit 0.4s; avifenc q73 nofit 0.4s
 2026-11-05 02:55:56	ext renamed	liar.jpg	liar.webp	0.000	0.000	0.000	0.0	image	.webp		
 ```
@@ -174,7 +174,8 @@ Date	Action	Source	Result	SrcMB	DstMB	SavedMB	Seconds	Kind	Format	Quality	Commen
 
 Тот же файл `image_compressor.db` (SQLite), что и у Python-версии, таблица
 `processed_images`. Go бесследно добавляет свои колонки; колонка `achieved` = фактическое
-качество результата вместе с победившим энкодером (`avifenc q=85`, `svt crf=34 vmaf=96.4`) —
+качество результата вместе с победившим энкодером и как он его гнал (`avifenc q=85`,
+`svt p8 crf=34 vmaf=96.4` — у SVT виден пресет) —
 всегда видно, на каком качестве и чем файл уже лежит. Правило неизменное: **хэш содержимого
 файла в БД → файл никогда не трогается повторно.**
 
@@ -237,7 +238,7 @@ Date	Action	Source	Result	SrcMB	DstMB	SavedMB	Seconds	Kind	Format	Quality	Commen
   AV1-энкодер микро-кодированием (2 кадра) — в цепочку попадают только живые; если
   SVT-AV1 в ffmpeg нет (essentials-сборка), auto честно деградирует до `libaom-av1`.
 - **Какой энкодер реально сжал каждый файл** — пишется в БД (`achieved`) и в журнал
-  (колонка Quality: `svt crf=28`, `avifenc q=85`). Шкалы crf между энкодерами не
+  (колонка Quality: `svt p8 crf=28`, `avifenc q=85`). Шкалы crf между энкодерами не
   сравниваются — запись за тем, чтобы это было видно.
 - **Длительность каждой кодировки и guard-проверки** файла пишется в колонку `Comment`
   журнала: `svt crf28 nofit 1180.2s; svt crf34 kept 1350.4s; vmaf=97.1 guard 210.3s` —

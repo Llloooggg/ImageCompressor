@@ -459,9 +459,9 @@ func (r *Runner) statusBlock(header string, maxw int) []string {
 	for i := 0; i < workers; i++ {
 		if i < len(jobs) {
 			j := jobs[i]
-			lines = append(lines, clip(fmt.Sprintf("%2d  %8s  %-18s  %s", i+1, fmtDurShort(now.Sub(j.start)), slotPos(j), j.rel), clipw))
+			lines = append(lines, clip(fmt.Sprintf("%2d  %8s  %-21s  %s", i+1, fmtDurShort(now.Sub(j.start)), slotPos(j), j.rel), clipw))
 		} else {
-			lines = append(lines, fmt.Sprintf("%2d  %8s  %s", i+1, "--", "--"))
+			lines = append(lines, fmt.Sprintf("%2d  %8s", i+1, "--"))
 		}
 	}
 	return lines
@@ -1276,8 +1276,12 @@ func (r *Runner) printBreak(print func()) {
 // achievedFor renders the actual result quality stored in the DB ("achieved"
 // column) — for future runs it answers "at what quality does this file already
 // sit, is there room to squeeze further?". It leads with the encoder that won
-// ("svt crf=34 vmaf=96.4", "avifenc q=85"): encoder choice is audit data like
-// quality is, and the scales are not comparable across encoders.
+// and how it was driven ("svt p8 crf=34 vmaf=96.4", "avifenc q=85"): encoder
+// choice is audit data like quality is, and the scales are not comparable
+// across encoders. The SVT preset rides along (it changes size/quality, so
+// "was this file pushed at 8 or at 6?" decides whether re-running is worth
+// it); other encoders ignore --video-preset, so it only appears for svt.
+// 10-bit is canon-on for every AV1 output — invariant, not recorded.
 func (r *Runner) achievedFor(k detect.Kind, v media.VideoResult, p media.PhotoResult) string {
 	head := ""
 	switch k {
@@ -1287,6 +1291,9 @@ func (r *Runner) achievedFor(k detect.Kind, v media.VideoResult, p media.PhotoRe
 		}
 		if v.Codec != "" {
 			head = v.Codec + " "
+		}
+		if v.Codec == "svt" && r.opts.VideoPreset > 0 {
+			head += fmt.Sprintf("p%d ", r.opts.VideoPreset)
 		}
 		if v.VMAF >= 0 {
 			return fmt.Sprintf("%scrf=%d vmaf=%.1f", head, v.CRF, v.VMAF)

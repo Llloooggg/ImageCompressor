@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/Llloooggg/ImageCompressor/internal/config"
+	"github.com/Llloooggg/ImageCompressor/internal/detect"
+	"github.com/Llloooggg/ImageCompressor/internal/media"
 )
 
 // captureStdout swaps os.Stdout for a pipe while f runs and returns what was
@@ -169,6 +171,41 @@ func TestStatusSlotProgress(t *testing.T) {
 	lines = r2.statusBlock("hdr", 200)
 	if !strings.Contains(lines[1], "crf34 1:05") || strings.Contains(lines[1], "/") {
 		t.Errorf("unknown-duration pass must show position only: %q", lines[1])
+	}
+
+	// over-1h media (the nina 1:30:22 case): full h:mm:ss pair must fit the
+	// column without pushing the path out of alignment
+	r3 := &Runner{multi: true, processRoot: `C:\arc`, cfg: &config.Config{Workers: 2}}
+	r3.trackStart(`C:\arc\family\nina.avi`)
+	r3.trackTotal(`family\nina.avi`, 5_422_000)
+	r3.trackProgress(`family\nina.avi`, "crf28", 4_591_000)
+	r3.trackStart(`C:\arc\x.jpg`)
+	lines = r3.statusBlock("hdr", 200)
+	want := "crf28 1:16:31/1:30:22" // 21 chars: exactly the column width
+	if !strings.Contains(lines[1], want+`  family\nina.avi`) {
+		t.Errorf("over-1h position must fit the column: %q", lines[1])
+	}
+}
+
+func TestAchievedForEncoders(t *testing.T) {
+	r := &Runner{opts: media.Opts{VideoPreset: 8, PhotoQ: 85}}
+	if got := r.achievedFor(detect.KindVideo, media.VideoResult{CRF: 28, VMAF: -1, Codec: "svt"}, media.PhotoResult{}); got != "svt p8 crf=28" {
+		t.Errorf("svt achieved must carry codec+preset+crf: %q", got)
+	}
+	if got := r.achievedFor(detect.KindVideo, media.VideoResult{CRF: 34, VMAF: 96.4, Codec: "svt"}, media.PhotoResult{}); got != "svt p8 crf=34 vmaf=96.4" {
+		t.Errorf("svt achieved must carry vmaf too: %q", got)
+	}
+	// nvenc ignores --video-preset: no p-marker may be recorded for it
+	if got := r.achievedFor(detect.KindVideo, media.VideoResult{CRF: 28, VMAF: -1, Codec: "nvenc"}, media.PhotoResult{}); got != "nvenc crf=28" {
+		t.Errorf("gpu winner must not carry a preset marker: %q", got)
+	}
+	// preset 0 = codec default: nothing to record
+	r0 := &Runner{opts: media.Opts{}}
+	if got := r0.achievedFor(detect.KindVideo, media.VideoResult{CRF: 28, VMAF: -1, Codec: "svt"}, media.PhotoResult{}); got != "svt crf=28" {
+		t.Errorf("preset 0 must not add a marker: %q", got)
+	}
+	if got := r.achievedFor(detect.KindImage, media.VideoResult{}, media.PhotoResult{Q: 85, VMAF: -1, Codec: "avifenc"}); got != "avifenc q=85" {
+		t.Errorf("photo achieved: %q", got)
 	}
 }
 
