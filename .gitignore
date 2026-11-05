@@ -1,7 +1,5 @@
 # Go build output
 /dist/
-/bin/
-/build/
 *.exe
 *.dll
 *.so
