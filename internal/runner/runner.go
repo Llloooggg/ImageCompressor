@@ -346,9 +346,9 @@ func (r *Runner) Run(ctx context.Context) error {
 			if gctx.Err() != nil {
 				return nil // stop requested: don't start new files
 			}
-			r.trackStart(f)
+			slot := r.trackStart(f)
 			r.process(gctx, f)
-			r.trackEnd(f)
+			r.trackEnd(slot)
 			n := r.done.Add(1)
 			if tty {
 				r.printStatus(start)
@@ -362,17 +362,11 @@ func (r *Runner) Run(ctx context.Context) error {
 	close(statusStop)
 	statusWg.Wait()
 	if r.multi && r.statusVis {
-		// cursor sits at the end of the block's last row: step up to the
-		// first row, then clear every row of the fixed-height block.
-		n := r.blockLines()
-		fmt.Printf("\x1b[%dA", n-1)
-		for i := 0; i < n; i++ {
-			fmt.Print("\x1b[2K")
-			if i < n-1 {
-				fmt.Print("\n")
-			}
-		}
-		fmt.Print("\r")
+		// The end-of-run summary prints BELOW the block: the final worker
+		// rows stay readable (the battle complaint: "the done-line wiped all
+		// the previous rows"). A single newline moves below the block whose
+		// cursor already sits on its last row.
+		fmt.Print("\n")
 	} else if tty && !r.multi {
 		fmt.Print("\r" + strings.Repeat(" ", 110) + "\r")
 	}
@@ -419,18 +413,14 @@ func (r *Runner) printStatus(start time.Time) {
 	}
 	el := time.Since(start)
 	savedMB := float64(r.origBytes.Load()-r.newBytes.Load()) / (1024 * 1024)
-	// ETA from scanned bytes already accounted for (file-count ETA is skewed
-	// by instant skip-hits; bytes track real work much better).
-	eta := "--:--:--"
-	doneB, scanB := r.origBytes.Load(), r.scanBytes.Load()
-	if doneB > 0 && scanB > doneB {
-		eta = fmtDur(time.Duration(float64(el) * float64(scanB-doneB) / float64(doneB)))
-	}
-	header := fmt.Sprintf("[%s] %d/%d (%d%%)  ok:%d already:%d nofit:%d ext:%d err:%d  |  saved %.0f MB  |  ETA %s",
+	// ETA deliberately absent: the byte-rate estimate lied under the
+	// videos-queued-last order (photo phase runs fast MB/s, then the video
+	// giants rewrite it upward several times). Counters + saved tell the truth.
+	header := fmt.Sprintf("[%s] %d/%d (%d%%)  ok:%d already:%d nofit:%d ext:%d err:%d  |  saved %.0f MB",
 		fmtDur(el), done, r.total, pct,
 		r.processed.Load(), r.skipDone.Load(), r.skipNotSmaller.Load(),
 		r.fixedExt.Load(), r.errored.Load(),
-		savedMB, eta)
+		savedMB)
 	if !r.multi {
 		fmt.Print("\r" + fmt.Sprintf("%-110s", header))
 		return
@@ -463,9 +453,10 @@ func (r *Runner) printStatus(start time.Time) {
 	r.statusVis = true
 }
 
-// statusBlock builds the fixed-height live block: header + one row per worker
-// slot (always r.cfg.Workers rows, idle slots show dashes). maxw clips a row
-// to the console width (rune-safe) so it never wraps.
+// statusBlock builds the fixed-height live block: counter header + a column
+// title row + exactly r.cfg.Workers slot rows (slot i is always worker i;
+// empty slots show dashes so nothing ever shifts vertically). maxw clips a
+// row to the console width (rune-safe) so it never wraps.
 func (r *Runner) statusBlock(header string, maxw int) []string {
 	workers := r.cfg.Workers
 	if workers < 1 {
@@ -476,17 +467,19 @@ func (r *Runner) statusBlock(header string, maxw int) []string {
 	copy(jobs, r.active)
 	r.activeMu.Unlock()
 
-	lines := make([]string, 0, workers+1)
-	lines = append(lines, header)
+	lines := make([]string, 0, workers+2)
 	// clip budget leaves room for clip's ellipsis so the row (with "...")
 	// still fits the console width and never wraps.
 	clipw := maxw - 3
 	if clipw < 8 {
 		clipw = 8
 	}
+	lines = append(lines, header)
+	// column titles: same fixed widths as the slot rows below
+	lines = append(lines, clip(fmt.Sprintf("%2s  %8s  %-21s  %s", "#", "elapsed", "stage/position", "file"), clipw))
 	now := time.Now()
 	for i := 0; i < workers; i++ {
-		if i < len(jobs) {
+		if i < len(jobs) && jobs[i].rel != "" {
 			j := jobs[i]
 			lines = append(lines, clip(fmt.Sprintf("%2d  %8s  %-21s  %s", i+1, fmtDurShort(now.Sub(j.start)), slotPos(j), j.rel), clipw))
 		} else {
@@ -507,6 +500,9 @@ func slotPos(j activeJob) string {
 	if j.stage == "queued" {
 		return "queued"
 	}
+	if j.curMs < 0 {
+		return j.stage // phase marker without a timeline (e.g. "crf34 vmaf":
+	} // encode finished, the metric pass runs, position is frozen by design
 	if j.curMs <= 0 && j.durMs <= 0 {
 		return j.stage // photo/animated ladder step (q85, lossless): no timeline
 	}
@@ -541,31 +537,50 @@ func (r *Runner) blockLines() int {
 	if w < 1 {
 		w = 1
 	}
-	return w + 1
+	return w + 2 // counter header + column titles + one row per worker slot
 }
 
-// trackStart/trackEnd maintain the live list of in-flight files (only when
-// the two-line status is on; skips are tracked too, they are cheap).
-func (r *Runner) trackStart(path string) {
+// trackStart/trackEnd maintain the live fixed-slot status rows (only when the
+// status block is on; skips are tracked too, they are cheap). Slots are
+// positional: slot i is ALWAYS worker-row i — when a file finishes, its row
+// falls back to dashes and the next file re-uses that row. No row ever shifts
+// (the battle complaint: "the runner jumps between rows, cells move up").
+// trackStart returns the claimed slot index (-1 when not tracking).
+func (r *Runner) trackStart(path string) int {
 	if !r.multi {
-		return
+		return -1
+	}
+	w := r.cfg.Workers
+	if w < 1 {
+		w = 1
 	}
 	r.activeMu.Lock()
-	r.active = append(r.active, activeJob{rel: r.rel(path), start: time.Now()})
-	r.activeMu.Unlock()
-}
-
-func (r *Runner) trackEnd(path string) {
-	if !r.multi {
-		return
+	if len(r.active) < w {
+		grow := make([]activeJob, w)
+		copy(grow, r.active)
+		r.active = grow
 	}
-	rel := r.rel(path)
-	r.activeMu.Lock()
+	idx := -1
 	for i := range r.active {
-		if r.active[i].rel == rel {
-			r.active = append(r.active[:i], r.active[i+1:]...)
+		if r.active[i].rel == "" {
+			idx = i
 			break
 		}
+	}
+	if idx >= 0 {
+		r.active[idx] = activeJob{rel: r.rel(path), start: time.Now()}
+	}
+	r.activeMu.Unlock()
+	return idx
+}
+
+func (r *Runner) trackEnd(idx int) {
+	if idx < 0 {
+		return
+	}
+	r.activeMu.Lock()
+	if idx < len(r.active) {
+		r.active[idx] = activeJob{}
 	}
 	r.activeMu.Unlock()
 }
@@ -816,6 +831,11 @@ func (r *Runner) process(ctx context.Context, path string) {
 		media.StillVideo(ctx, r.loc, path)
 
 	rel := r.rel(path)
+	// If a journal row existed here, it was "nochange" with a changed settings
+	// stamp (the compressed outcome returns above): re-evaluating and failing
+	// to shrink again CONFIRMS the old decision, so it counts in `already`,
+	// not `nofit` (the user's counter semantics: nofit = new verdicts only).
+	retried := processed
 
 	// Dry run: just report what would change.
 	if r.cfg.DryRun {
@@ -829,7 +849,7 @@ func (r *Runner) process(ctx context.Context, path string) {
 		return
 	}
 
-	r.encodeSwap(ctx, path, rel, h, res, still)
+	r.encodeSwap(ctx, path, rel, h, res, still, retried)
 }
 
 // observe records a content hash this walk has seen (end-of-run journal GC).
@@ -839,7 +859,7 @@ func (r *Runner) observe(h string) {
 	r.observedMu.Unlock()
 }
 
-func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res detect.Result, still bool) {
+func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res detect.Result, still, retried bool) {
 	t0 := time.Now() // per-file wall time -> journal Seconds column (how long this file took)
 	if still {
 		// The file collapses video -> photo: everything downstream (target
@@ -930,7 +950,11 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 	encNote := attemptsComment(vinfo, pinfo) // per-attempt audit -> journal Comment
 	if errors.Is(encErr, media.ErrNotSmaller) {
 		safefs.RemoveIfExists(tmp)
-		r.skipNotSmaller.Add(1)
+		if retried {
+			r.skipDone.Add(1) // re-confirming the journal's "nochange" under changed settings
+		} else {
+			r.skipNotSmaller.Add(1) // new "could not shrink" verdict of this run
+		}
 		r.addSize(path, path)
 		_ = r.store.MarkNoChange(ctx, srcHash, rel, res.Kind.String(), r.stampFor(res.Kind))
 		r.changes.record("not smaller", rel, rel, origSize, origSize, time.Since(t0).Seconds(), res.Kind.String(), mediaFormatFor(res, finalPath), "", encNote)
@@ -983,7 +1007,11 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 	origInfo, _ := os.Stat(path)
 	if newInfo != nil && origInfo != nil && newInfo.Size() >= origInfo.Size() {
 		safefs.RemoveIfExists(tmp)
-		r.skipNotSmaller.Add(1)
+		if retried {
+			r.skipDone.Add(1) // re-confirming the journal's "nochange" under changed settings
+		} else {
+			r.skipNotSmaller.Add(1) // new "could not shrink" verdict of this run
+		}
 		r.addSize(path, path)
 		_ = r.store.MarkNoChange(ctx, srcHash, rel, res.Kind.String(), r.stampFor(res.Kind))
 		r.changes.record("not smaller", rel, rel, origInfo.Size(), newInfo.Size(), time.Since(t0).Seconds(), res.Kind.String(), mediaFormatFor(res, finalPath), "", encNote)

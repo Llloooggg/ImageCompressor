@@ -50,9 +50,15 @@ func TestPrintStatusFixedBlock(t *testing.T) {
 	if !strings.Contains(out1, "(33%)") {
 		t.Errorf("expected truncated 33%% for 1/3, got %q", out1)
 	}
-	// fixed height: header + 2 idle worker slots, all on first draw
-	if got := strings.Count(out1, "\n"); got != 2 {
-		t.Errorf("block must be 3 rows (2 newlines), got %d: %q", got, out1)
+	// fixed height: counter header + column titles + 2 idle worker slots
+	if got := strings.Count(out1, "\n"); got != 3 {
+		t.Errorf("block must be 4 rows (3 newlines), got %d: %q", got, out1)
+	}
+	if !strings.Contains(out1, "elapsed") || !strings.Contains(out1, "stage/position") {
+		t.Errorf("column title row missing: %q", out1)
+	}
+	if strings.Contains(out1, "ETA") {
+		t.Errorf("ETA was removed (it lied under videos-queued-last): %q", out1)
 	}
 	if !strings.Contains(out1, "--") {
 		t.Errorf("idle worker slots must show dashes: %q", out1)
@@ -65,11 +71,11 @@ func TestPrintStatusFixedBlock(t *testing.T) {
 	}
 
 	out2 := captureStdout(t, func() { r.printStatus(time.Now()) })
-	if !strings.Contains(out2, "\x1b[2A") {
+	if !strings.Contains(out2, "\x1b[3A") {
 		t.Errorf("second repaint must step up blockLines-1 rows, got %q", out2)
 	}
-	if got := strings.Count(out2, "\x1b[2K"); got != 3 {
-		t.Errorf("repaint must clear every block row (%d), got %d: %q", 3, got, out2)
+	if got := strings.Count(out2, "\x1b[2K"); got != 4 {
+		t.Errorf("repaint must clear every block row (%d), got %d: %q", 4, got, out2)
 	}
 
 	// the battle bug: 46422/46423 rounded to "100%" while workers still ran
@@ -106,27 +112,35 @@ func TestFmtDurShort(t *testing.T) {
 func TestStatusBlockSlots(t *testing.T) {
 	r := &Runner{multi: true, processRoot: `C:\arc`, cfg: &config.Config{}}
 	r.cfg.Workers = 2
-	r.trackStart(`C:\arc\family\holiday.mp4`)
-	r.trackStart(`C:\arc\family\second very long file name with a lot of characters here.mp4`)
-	lines := r.statusBlock("hdr", 200)
-	if len(lines) != 3 {
-		t.Fatalf("want header + 2 slots, got %d: %q", len(lines), lines)
+	slotA := r.trackStart(`C:\arc\family\holiday.mp4`)
+	slotB := r.trackStart(`C:\arc\family\second very long file name with a lot of characters here.mp4`)
+	if slotA != 0 || slotB != 1 {
+		t.Fatalf("slots must be positional: got %d,%d", slotA, slotB)
 	}
-	if !strings.Contains(lines[1], `family\holiday.mp4`) {
-		t.Errorf("slot 1 must show the relative path: %q", lines[1])
+	lines := r.statusBlock("hdr", 200)
+	if len(lines) != 4 {
+		t.Fatalf("want counter header + column titles + 2 slots, got %d: %q", len(lines), lines)
+	}
+	if !strings.Contains(lines[2], `family\holiday.mp4`) {
+		t.Errorf("slot 1 must show the relative path: %q", lines[2])
 	}
 	// time comes FIRST (fixed column), then the path
-	if idxT, idxP := strings.Index(lines[1], "0s"), strings.Index(lines[1], `family\`); idxT == -1 || idxP == -1 || idxT > idxP {
-		t.Errorf("elapsed time must precede the path: %q", lines[1])
+	if idxT, idxP := strings.Index(lines[2], "0s"), strings.Index(lines[2], `family\`); idxT == -1 || idxP == -1 || idxT > idxP {
+		t.Errorf("elapsed time must precede the path: %q", lines[2])
 	}
 
-	r.trackEnd(`C:\arc\family\holiday.mp4`)
+	// THE SLOT CONTRACT: finishing a file blanks its OWN row; the other file
+	// never moves (the battle bug: a compacted list made rows shift upward).
+	r.trackEnd(slotA)
 	lines = r.statusBlock("hdr", 200)
-	if strings.Contains(lines[1]+lines[2], "holiday.mp4") {
-		t.Errorf("finished file still in a worker slot: %q", lines)
+	if strings.Contains(lines[2], "holiday.mp4") || !strings.Contains(lines[2], "--") {
+		t.Errorf("freed row must fall back to dashes: %q", lines[2])
 	}
-	if !strings.Contains(lines[2], "--") {
-		t.Errorf("freed slot must fall back to dashes: %q", lines)
+	if !strings.Contains(lines[3], "second very long file name") {
+		t.Errorf("the running file must NOT move rows: %q", lines[3])
+	}
+	if slotAgain := r.trackStart(`C:\arc\new.mp4`); slotAgain != slotA {
+		t.Errorf("a freed slot must be re-used, not appended: got %d want %d", slotAgain, slotA)
 	}
 	// a slot row may never exceed the console width: long paths get clipped
 	// (clip's ellipsis counted: statusBlock budgets maxw-3 for it)
@@ -145,32 +159,40 @@ func TestStatusSlotProgress(t *testing.T) {
 
 	// no encode yet: middle column empty, path still visible
 	lines := r.statusBlock("hdr", 200)
-	if !strings.Contains(lines[1], `family\nina.mkv`) {
-		t.Fatalf("slot lost the path: %q", lines[1])
+	if !strings.Contains(lines[2], `family\nina.mkv`) {
+		t.Fatalf("slot lost the path: %q", lines[2])
 	}
 
 	// lane wait must be visible (the battle complaint: "stuck or moving?")
 	r.trackProgress(rel, "queued", 0)
 	lines = r.statusBlock("hdr", 200)
-	if !strings.Contains(lines[1], "queued") {
-		t.Errorf("lane wait must show queued: %q", lines[1])
+	if !strings.Contains(lines[2], "queued") {
+		t.Errorf("lane wait must show queued: %q", lines[2])
 	}
 
 	// encode pass with known duration: position/total in the slot
 	r.trackTotal(rel, 802_000) // 13:22 of media (the nina case, scaled down)
 	r.trackProgress(rel, "crf28", 271_000)
 	lines = r.statusBlock("hdr", 200)
-	if !strings.Contains(lines[1], "crf28 4:31/13:22") {
-		t.Errorf("encode position column wrong: %q", lines[1])
+	if !strings.Contains(lines[2], "crf28 4:31/13:22") {
+		t.Errorf("encode position column wrong: %q", lines[2])
+	}
+
+	// VMAF guard phase (the "stuck at 22:40/22:40" case): encode is done, the
+	// metric pass runs; curMs=-1 means label-only, NO frozen timeline
+	r.trackProgress(rel, "crf34 (3/3) vmaf", -1)
+	lines = r.statusBlock("hdr", 200)
+	if !strings.Contains(lines[2], "crf34 (3/3) vmaf") || strings.Contains(lines[2], "/13:22") {
+		t.Errorf("vmaf phase must show as a phase, not a frozen position: %q", lines[2])
 	}
 
 	// unknown duration: position alone still proves movement
 	r2 := &Runner{multi: true, processRoot: `C:\arc`, cfg: &config.Config{Workers: 1}}
 	r2.trackStart(`C:\arc\family\nina.mkv`)
-	r2.trackProgress(rel, "crf34", 65_000)
+	r2.trackProgress(rel, "crf34 (2/3)", 65_000)
 	lines = r2.statusBlock("hdr", 200)
-	if !strings.Contains(lines[1], "crf34 1:05") || strings.Contains(lines[1], "/") {
-		t.Errorf("unknown-duration pass must show position only: %q", lines[1])
+	if !strings.Contains(lines[2], "crf34 (2/3) 1:05") || strings.Contains(lines[2], "1:05/") {
+		t.Errorf("unknown-duration pass must show position only: %q", lines[2])
 	}
 
 	// over-1h media (the nina 1:30:22 case): full h:mm:ss pair must fit the
@@ -182,16 +204,16 @@ func TestStatusSlotProgress(t *testing.T) {
 	r3.trackStart(`C:\arc\x.jpg`)
 	lines = r3.statusBlock("hdr", 200)
 	want := "crf28 1:16:31/1:30:22" // 21 chars: exactly the column width
-	if !strings.Contains(lines[1], want+`  family\nina.avi`) {
-		t.Errorf("over-1h position must fit the column: %q", lines[1])
+	if !strings.Contains(lines[2], want+`  family\nina.avi`) {
+		t.Errorf("over-1h position must fit the column: %q", lines[2])
 	}
 	// photo/animated: current ladder step, label only (no timeline to place)
 	r4 := &Runner{multi: true, processRoot: `C:\arc`, cfg: &config.Config{Workers: 1}}
 	r4.trackStart(`C:\arc\family\photo.jpg`)
-	r4.trackProgress(`family\photo.jpg`, "q85", 0)
+	r4.trackProgress(`family\photo.jpg`, "q85 (1/3)", 0)
 	lines = r4.statusBlock("hdr", 200)
-	if !strings.Contains(lines[1], "q85") || strings.Contains(lines[1], "/") {
-		t.Errorf("photo slot must show the ladder step without a position: %q", lines[1])
+	if !strings.Contains(lines[2], "q85 (1/3)") || strings.Contains(lines[2], "/3:22") {
+		t.Errorf("photo slot must show the ladder step without a position: %q", lines[2])
 	}
 }
 

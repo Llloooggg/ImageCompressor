@@ -171,12 +171,12 @@ func EncodeImage(ctx context.Context, loc *tools.Locator, o Opts, src, tmp strin
 	record := func(what string, d time.Duration) {
 		attempts = append(attempts, fmt.Sprintf("%s %.1fs", what, d.Seconds()))
 	}
-	attempt := func(q int) (kept, ran bool, lastErr error, win string) {
+	attempt := func(q int, sfx string) (kept, ran bool, lastErr error, win string) {
 		if progress != nil {
 			if o.PhotoLoss {
 				progress("lossless")
 			} else {
-				progress(fmt.Sprintf("q%d", q))
+				progress(fmt.Sprintf("q%d%s", q, sfx))
 			}
 		}
 		t0 := time.Now()
@@ -206,7 +206,7 @@ func EncodeImage(ctx context.Context, loc *tools.Locator, o Opts, src, tmp strin
 	}
 
 	if o.PhotoLoss {
-		kept, ran, err, win := attempt(o.PhotoQ)
+		kept, ran, err, win := attempt(o.PhotoQ, "")
 		if kept {
 			return PhotoResult{Q: o.PhotoQ, VMAF: -1, Codec: codecShort(win)}, nil
 		}
@@ -220,7 +220,11 @@ func EncodeImage(ctx context.Context, loc *tools.Locator, o Opts, src, tmp strin
 	anyRan := false
 	var lastErr error
 	for i, lvl := range ladder {
-		kept, ran, err, win := attempt(lvl)
+		sfx := ""
+		if len(ladder) > 1 { // ladder position for the live status (hidden when single-step)
+			sfx = fmt.Sprintf(" (%d/%d)", i+1, len(ladder))
+		}
+		kept, ran, err, win := attempt(lvl, sfx)
 		anyRan = anyRan || ran
 		if err != nil {
 			lastErr = err
@@ -230,6 +234,9 @@ func EncodeImage(ctx context.Context, loc *tools.Locator, o Opts, src, tmp strin
 		}
 		if i == 0 || o.PhotoVMAFMin <= 0 {
 			return PhotoResult{Q: lvl, VMAF: -1, Codec: codecShort(win)}, nil // base level: user's order; or guard disabled
+		}
+		if progress != nil {
+			progress(fmt.Sprintf("q%d%s vmaf", lvl, sfx)) // encode done, the metric pass runs
 		}
 		if s := score(); s < 0 || s >= o.PhotoVMAFMin {
 			return PhotoResult{Q: lvl, VMAF: s, Codec: codecShort(win)}, nil // passed the floor (no metric -> honest fallback)
@@ -243,7 +250,7 @@ func EncodeImage(ctx context.Context, loc *tools.Locator, o Opts, src, tmp strin
 			if mid <= lo || mid >= hi {
 				break
 			}
-			k2, ran2, e2, win2 := attempt(mid)
+			k2, ran2, e2, win2 := attempt(mid, " (bis)")
 			anyRan = anyRan || ran2
 			if e2 != nil {
 				lastErr = e2
@@ -251,6 +258,9 @@ func EncodeImage(ctx context.Context, loc *tools.Locator, o Opts, src, tmp strin
 			if !k2 {
 				hi = mid // still not smaller: compress harder
 				continue
+			}
+			if progress != nil {
+				progress(fmt.Sprintf("q%d (bis) vmaf", mid))
 			}
 			if s2 := score(); s2 < 0 || s2 >= o.PhotoVMAFMin {
 				return PhotoResult{Q: mid, VMAF: s2, Codec: codecShort(win2)}, nil // both smaller and imperceptible
@@ -572,11 +582,11 @@ func EncodeVideo(ctx context.Context, loc *tools.Locator, o Opts, chain VideoCha
 		attempts = append(attempts, fmt.Sprintf("%s %.1fs", what, d.Seconds()))
 	}
 
-	attempt := func(ch VideoChain, audioArgs []string, normalize bool, label string) (kept, ran bool, lastErr error, win string) {
+	attempt := func(ch VideoChain, audioArgs []string, normalize bool, label, status string) (kept, ran bool, lastErr error, win string) {
 		for _, c := range ch.cands {
 			args := videoFFArgs(c, audioArgs, o.CPUBudget, o.VideoPreset, normalize, src, tmp)
 			t0 := time.Now()
-			if err := runEnc(ctx, loc, ff, progress, label, args...); err != nil {
+			if err := runEnc(ctx, loc, ff, progress, status, args...); err != nil {
 				lastErr = fmt.Errorf("%s: %w", c.codec, err)
 				os.Remove(tmp)
 				record(fmt.Sprintf("%s %s fail", codecShort(c.codec), label), time.Since(t0))
@@ -595,14 +605,23 @@ func EncodeVideo(ctx context.Context, loc *tools.Locator, o Opts, chain VideoCha
 
 	ladder := CRFLadder(chain.crf)
 
-	// runLadder walks the whole ladder for one audio strategy, applying the
-	// VMAF guard + bisection to escalated winners (see function doc).
-	runLadder := func(audioArgs []string, normalize bool) (kept bool, info VideoResult, anyRan bool, lastErr error) {
+	// runLadder walks the whole ladder for one encoder chain + audio
+	// strategy, applying the VMAF guard + bisection to escalated winners
+	// (see function doc).
+	runLadder := func(ch VideoChain, audioArgs []string, normalize bool) (kept bool, info VideoResult, anyRan bool, lastErr error) {
 		for i, lvl := range ladder {
-			kept, ran, err, win := attempt(chain.WithCRF(lvl), audioArgs, normalize, fmt.Sprintf("crf%d", lvl))
+			tag := fmt.Sprintf("crf%d", lvl)
+			sfx := ""
+			if len(ladder) > 1 { // ladder position for the live status (hidden when single-step)
+				sfx = fmt.Sprintf(" (%d/%d)", i+1, len(ladder))
+			}
+			kept, ran, err, win := attempt(ch.WithCRF(lvl), audioArgs, normalize, tag, tag+sfx)
 			if kept {
 				if i == 0 || o.VideoVMAFMin <= 0 {
 					return true, VideoResult{CRF: lvl, VMAF: -1, Codec: codecShort(win)}, true, nil // base level: user's order; or guard disabled
+				}
+				if progress != nil {
+					progress(tag+sfx+" vmaf", -1) // encode finished, the metric pass runs (position frozen by design: the "stuck at 22:40/22:40" case)
 				}
 				t0 := time.Now()
 				score := vmafScore(ctx, loc, ff, tmp, src, o.CPUBudget)
@@ -619,7 +638,8 @@ func EncodeVideo(ctx context.Context, loc *tools.Locator, o Opts, chain VideoCha
 					if mid <= lo || mid >= hi {
 						break
 					}
-					k2, ran2, e2, win2 := attempt(chain.WithCRF(mid), audioArgs, normalize, fmt.Sprintf("crf%d", mid))
+					tag2 := fmt.Sprintf("crf%d", mid)
+					k2, ran2, e2, win2 := attempt(ch.WithCRF(mid), audioArgs, normalize, tag2, tag2+" (bis)")
 					anyRan = anyRan || ran2
 					if e2 != nil {
 						lastErr = e2
@@ -627,6 +647,9 @@ func EncodeVideo(ctx context.Context, loc *tools.Locator, o Opts, chain VideoCha
 					if !k2 {
 						lo = mid // still not smaller: push crf up
 						continue
+					}
+					if progress != nil {
+						progress(tag2+" (bis) vmaf", -1)
 					}
 					t1 := time.Now()
 					s2 := vmafScore(ctx, loc, ff, tmp, src, o.CPUBudget)
@@ -650,7 +673,7 @@ func EncodeVideo(ctx context.Context, loc *tools.Locator, o Opts, chain VideoCha
 	}
 
 	// Pass 1: lossless audio copy across the ladder.
-	kept, info, anyRan, lastErr := runLadder([]string{"-c:a", "copy"}, false)
+	kept, info, anyRan, lastErr := runLadder(chain, []string{"-c:a", "copy"}, false)
 	if kept {
 		info.Attempts = attempts
 		return info, nil
@@ -663,7 +686,7 @@ func EncodeVideo(ctx context.Context, loc *tools.Locator, o Opts, chain VideoCha
 
 	// Pass 2: audio copy failed for every encoder on every level ->
 	// container/audio incompatible. Transcode audio to AAC across the ladder.
-	kept, info, anyRan, lastErr = runLadder([]string{"-c:a", "aac", "-b:a", "192k"}, false)
+	kept, info, anyRan, lastErr = runLadder(chain, []string{"-c:a", "aac", "-b:a", "192k"}, false)
 	if kept {
 		info.Attempts = attempts
 		return info, nil
@@ -676,7 +699,7 @@ func EncodeVideo(ctx context.Context, loc *tools.Locator, o Opts, chain VideoCha
 	// space tags (gbr etc.) that AV1 encoders reject at init. Retry both
 	// audio strategies with an honest bt709 color conversion. This path can
 	// only help files that would otherwise error out.
-	kept, info, anyRan, err3 := runLadder([]string{"-c:a", "copy"}, true)
+	kept, info, anyRan, err3 := runLadder(chain, []string{"-c:a", "copy"}, true)
 	if kept {
 		info.Attempts = attempts
 		return info, nil
@@ -684,11 +707,67 @@ func EncodeVideo(ctx context.Context, loc *tools.Locator, o Opts, chain VideoCha
 	if anyRan {
 		return VideoResult{Attempts: attempts}, ErrNotSmaller
 	}
-	kept, info, _, lastErr = runLadder([]string{"-c:a", "aac", "-b:a", "192k"}, true)
+	kept, info, _, lastErr = runLadder(chain, []string{"-c:a", "aac", "-b:a", "192k"}, true)
 	if kept {
 		info.Attempts = attempts
 		return info, nil
 	}
+
+	// Pass 5 (last resort): still nothing ever STARTED. Real-world cause:
+	// screen-recording VFR files whose stream declares an absurd frame rate
+	// ("90k tbr") -> SVT refuses init ("maximum allowed frame rate is 240");
+	// hardware encoders take such files fine. Rescue = GPU insurance ONLY
+	// (measured canon: on the pathological screen file nvenc was 10x faster
+	// and 6x smaller than libaom). libaom stays flag-only (--max): auto never
+	// volunteers a 24x-slower CPU pass. Hardware never enters the normal auto
+	// lanes (size/quality canon), but rescuing a file that would otherwise
+	// only produce an error is a different question.
+	inChain := map[string]bool{}
+	for _, c := range chain.cands {
+		inChain[c.codec] = true
+	}
+	for _, mode := range []string{EncNVENC, EncAMF, EncQSV} {
+		rc := Opts{Encoder: mode, VideoCRF: chain.crf}.BuildVideoChain(chain.avail)
+		rc.mode, rc.avail = mode, chain.avail
+		// only encoders this box actually passed the live probe for
+		if len(rc.cands) == 0 || !chain.avail[rc.cands[0].codec] || inChain[rc.cands[0].codec] {
+			continue
+		}
+		kept, info, ranA, e := runLadder(rc, []string{"-c:a", "copy"}, false)
+		if kept {
+			info.Attempts = attempts
+			return info, nil
+		}
+		if ranA {
+			return VideoResult{Attempts: attempts}, ErrNotSmaller
+		}
+		if e != nil {
+			lastErr = e
+		}
+		kept, info, ranB, e2 := runLadder(rc, []string{"-c:a", "aac", "-b:a", "192k"}, false)
+		if kept {
+			info.Attempts = attempts
+			return info, nil
+		}
+		if ranB {
+			return VideoResult{Attempts: attempts}, ErrNotSmaller
+		}
+		if e2 != nil {
+			lastErr = e2
+		}
+		kept, info, ranC, e3 := runLadder(rc, []string{"-c:a", "copy"}, true) // exotic-color variant
+		if kept {
+			info.Attempts = attempts
+			return info, nil
+		}
+		if ranC {
+			return VideoResult{Attempts: attempts}, ErrNotSmaller
+		}
+		if e3 != nil {
+			lastErr = e3
+		}
+	}
+
 	if lastErr != nil {
 		return VideoResult{Attempts: attempts}, lastErr
 	}
