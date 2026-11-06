@@ -180,3 +180,93 @@ func TestPruneUnseen(t *testing.T) {
 		t.Fatalf("repeat prune failed: guarded=%v err=%v", guarded, err)
 	}
 }
+
+// TestSeenCache covers the re-read fast path: a path remembers its content
+// hash under the exact (size, mtime) it was hashed with; any change in the
+// triple is a miss and the real hash must be computed again. Renames move the
+// key, and the GC drops cache rows whose content left the journal.
+func TestSeenCache(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "seen.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	const (
+		path  = `family\clip.mp4`
+		hash  = "deadbeef"
+		size  = int64(12345)
+		mtime = int64(1_700_000_000_000_000_000)
+	)
+	if _, ok, err := s.SeenHash(ctx, path, size, mtime); err != nil || ok {
+		t.Fatalf("empty cache must miss: ok=%v err=%v", ok, err)
+	}
+	if err := s.RememberPath(ctx, path, size, mtime, hash); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := s.SeenHash(ctx, path, size, mtime)
+	if err != nil || !ok || got != hash {
+		t.Fatalf("exact triple must hit: got=%q ok=%v err=%v", got, ok, err)
+	}
+	// Size or mtime drift -> the content may have changed -> no shortcut.
+	if _, ok, _ := s.SeenHash(ctx, path, size+1, mtime); ok {
+		t.Fatal("size change must miss")
+	}
+	if _, ok, _ := s.SeenHash(ctx, path, size, mtime+1); ok {
+		t.Fatal("mtime change must miss")
+	}
+	// Unknown path is a miss, not an error.
+	if _, ok, err := s.SeenHash(ctx, `family\other.mp4`, size, mtime); err != nil || ok {
+		t.Fatalf("unknown path must miss: ok=%v err=%v", ok, err)
+	}
+
+	// Rename: the cached triple follows the file to the new name.
+	const honest = `family\clip.mov`
+	if err := s.RenamePath(ctx, path, honest); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := s.SeenHash(ctx, path, size, mtime); ok {
+		t.Fatal("old path must be gone after rename")
+	}
+	if got, ok, _ := s.SeenHash(ctx, honest, size, mtime); !ok || got != hash {
+		t.Fatal("renamed path must inherit the cache")
+	}
+
+	// Upsert: a new triple for the same path overwrites in place.
+	if err := s.RememberPath(ctx, honest, size*2, mtime*2, hash); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok, _ := s.SeenHash(ctx, honest, size*2, mtime*2); !ok || got != hash {
+		t.Fatalf("upsert failed: got=%q ok=%v", got, ok)
+	}
+
+	// GC: a cache row whose content left the journal is dead weight (the file
+	// was restored/replaced outside the tool), while the row for live content
+	// stays.
+	if err := s.MarkCompressed(ctx, hash, honest, "video", "svt p8 crf=28"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkCompressed(ctx, "live", `family\live.avif`, "image", "avifenc q=85"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RememberPath(ctx, `family\live.avif`, 1, 2, "live"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RememberPath(ctx, `family\stale.mp4`, 3, 4, "stale"); err != nil {
+		t.Fatal(err)
+	}
+	// The walk observed both live hashes, so the >50% guard does not fire.
+	if _, guarded, err := s.PruneUnseen(ctx, map[string]struct{}{hash: {}, "live": {}}); err != nil || guarded {
+		t.Fatalf("prune failed: guarded=%v err=%v", guarded, err)
+	}
+	if _, ok, _ := s.SeenHash(ctx, `family\stale.mp4`, 3, 4); ok {
+		t.Fatal("cache row for dead content must be pruned")
+	}
+	if _, ok, _ := s.SeenHash(ctx, honest, size*2, mtime*2); !ok {
+		t.Fatal("cache row for live content must survive")
+	}
+	if _, ok, _ := s.SeenHash(ctx, `family\live.avif`, 1, 2); !ok {
+		t.Fatal("cache row for live content must survive")
+	}
+}

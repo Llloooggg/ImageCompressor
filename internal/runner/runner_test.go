@@ -226,7 +226,7 @@ func TestEnsureHonestExt_Collision_KeepsFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r.ensureHonestExt(liar, res)
+	r.ensureHonestExt(ctx, liar, res)
 
 	if _, err := os.Stat(liar); err != nil {
 		t.Fatal("colliding file must stay in place")
@@ -407,7 +407,7 @@ func TestEnsureHonestExt_DoubledExt_Cleaned(t *testing.T) {
 		t.Fatal("ext not expected to lie here — the doubled chain alone must trigger the fix")
 	}
 
-	r.ensureHonestExt(path, res)
+	r.ensureHonestExt(context.Background(), path, res)
 
 	if _, err := os.Stat(filepath.Join(r.processRoot, "VID_2026.mp4")); err != nil {
 		t.Fatalf("clean name missing: %v", err)

@@ -106,6 +106,17 @@ func (s *Store) migrate(ctx context.Context) error {
 			tmp_path      TEXT NOT NULL,
 			created_at    TEXT NOT NULL
 		);`,
+		// seen is a re-read cache, NOT a second source of truth: it remembers
+		// which content hash a path had under a specific (size, mtime) stat
+		// triple. A repeat run over an unchanged archive can then skip hashing
+		// gigabytes entirely. Any mismatch (edit, restore, touch) falls back to
+		// the real hash - processed_images stays the only authority.
+		`CREATE TABLE IF NOT EXISTS seen (
+			path  TEXT PRIMARY KEY,
+			size  INTEGER NOT NULL,
+			mtime INTEGER NOT NULL,
+			hash  TEXT NOT NULL
+		);`,
 	}
 	for _, q := range stmts {
 		if _, err := s.db.ExecContext(ctx, q); err != nil {
@@ -182,6 +193,59 @@ func (s *Store) IsProcessed(ctx context.Context, hash string) (Record, bool, err
 	return r, true, nil
 }
 
+// SeenHash returns the content hash cached for path when the file's size and
+// mtime still match what was hashed. A miss means the caller must read the
+// file (new file, edited file, restored original, touched metadata). The
+// cache is a convenience only: processed_images remains the source of truth,
+// and every hit is still verified against it.
+func (s *Store) SeenHash(ctx context.Context, path string, size, mtime int64) (string, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var h string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT hash FROM seen WHERE path = ? AND size = ? AND mtime = ?`,
+		path, size, mtime).Scan(&h)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return h, true, nil
+}
+
+// RememberPath caches path -> content hash under the stat triple that proves
+// it was not modified since. Best effort: a failure is not worth stopping a
+// run (the next run just hashes that file again).
+func (s *Store) RememberPath(ctx context.Context, path string, size, mtime int64, hash string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO seen(path, size, mtime, hash) VALUES(?,?,?,?)
+		ON CONFLICT(path) DO UPDATE SET
+			size = excluded.size, mtime = excluded.mtime, hash = excluded.hash`,
+		path, size, mtime, hash)
+	return err
+}
+
+// RenamePath follows a rename (lying-extension fix, honest output name) so the
+// cached triple does not stay attached to a path that no longer exists.
+func (s *Store) RenamePath(ctx context.Context, oldPath, newPath string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.db.ExecContext(ctx, `UPDATE seen SET path = ? WHERE path = ?`, newPath, oldPath); err != nil {
+		// The target already has a cache row (primary-key clash): the old key
+		// is the stale one, drop it. Callers record the fresh triple right
+		// after, so nothing of value is lost either way.
+		_, derr := s.db.ExecContext(ctx, `DELETE FROM seen WHERE path = ?`, oldPath)
+		if derr != nil {
+			return derr
+		}
+		return nil
+	}
+	return nil
+}
+
 // shouldMergePaths: markProcessed/MarkNoChange upsert and merge the "|" filename list.
 
 // MarkCompressed records a hash we produced (canonical output on disk).
@@ -254,6 +318,11 @@ func (s *Store) PruneUnseen(ctx context.Context, seen map[string]struct{}) (dele
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
+		return 0, false, err
+	}
+	// Drop re-read cache entries whose content hash no longer exists: the path
+	// they describe belongs to dead content (restored original, deleted file).
+	if _, err := tx.ExecContext(ctx, `DELETE FROM seen WHERE hash NOT IN (SELECT hash FROM processed_images)`); err != nil {
 		return 0, false, err
 	}
 	if _, err := tx.ExecContext(ctx, `DROP TABLE _seen`); err != nil {

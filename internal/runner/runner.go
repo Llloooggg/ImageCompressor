@@ -602,6 +602,28 @@ func (r *Runner) trackTotal(rel string, durMs int64) {
 	r.activeMu.Unlock()
 }
 
+// trackStage labels a non-encoder phase (hash, still?, meta) so the slot
+// column never sits blank while the runner is actually working. Those phases
+// can take minutes on a big video (hashing a 300 MB file behind 12 readers on
+// a spinning disk); a blank cell reads as "stuck", a label reads as "busy".
+func (r *Runner) trackStage(rel, label string) {
+	r.trackProgress(rel, label, 0)
+}
+
+// rememberSeen records the path -> hash cache after a stable decision (skip,
+// nochange, or swap) so the next full run does not read the file again. The
+// key is the ABSOLUTE path: a shared --db used over different roots must never
+// collide two files that happen to share a relative name. Never in dry-run:
+// that mode must not write anything, and never without a real stat (size < 0).
+func (r *Runner) rememberSeen(ctx context.Context, path string, size, mtime int64, hash string) {
+	if r.cfg.DryRun || size < 0 || hash == "" {
+		return
+	}
+	if err := r.store.RememberPath(ctx, path, size, mtime, hash); err != nil {
+		r.logf("seen %s: %v", path, err)
+	}
+}
+
 // trackProgress applies one ffmpeg -progress sample (stage label + stream
 // position) to the in-flight slot. Called from the encoder's output scanner;
 // cheap and lock-scoped, progress lines arrive a few times per second.
@@ -789,11 +811,29 @@ func (r *Runner) process(ctx context.Context, path string) {
 		return
 	}
 
-	h, err := hashFile(path)
-	if err != nil {
-		r.errored.Add(1)
-		r.logf("hash %s: %v", path, err)
-		return
+	rel := r.rel(path)
+
+	// Hash-cache fast path (store.seen): if this exact path still carries the
+	// size+mtime we hashed last time, the content cannot have changed (archive
+	// media is never edited in place; an edit/restore bumps mtime). A hit
+	// skips reading gigabytes of video; a miss falls through to the real hash.
+	// The key is the absolute path (see rememberSeen).
+	var h string
+	size, mtime := int64(-1), int64(0)
+	if fi, serr := os.Stat(path); serr == nil {
+		size, mtime = fi.Size(), fi.ModTime().UnixNano()
+		if cached, ok, cerr := r.store.SeenHash(ctx, path, size, mtime); cerr == nil && ok {
+			h = cached
+		}
+	}
+	if h == "" {
+		r.trackStage(rel, "hash")
+		h, err = hashFile(path)
+		if err != nil {
+			r.errored.Add(1)
+			r.logf("hash %s: %v", path, err)
+			return
+		}
 	}
 	// Journal GC witness: this content exists in the tree right now.
 	r.observe(h)
@@ -812,13 +852,15 @@ func (r *Runner) process(ctx context.Context, path string) {
 			if rec.Stamp == r.stampFor(res.Kind) {
 				r.skipDone.Add(1)
 				r.addSize(path, path)
-				r.ensureHonestExt(path, res) // lying ext is fixed even for untouched files
+				p := r.ensureHonestExt(ctx, path, res) // lying ext is fixed even for untouched files
+				r.rememberSeen(ctx, p, size, mtime, h)
 				return
 			}
 		default: // compressed: our (or an adopted old) canonical output on disk
 			r.skipDone.Add(1)
 			r.addSize(path, path)
-			r.ensureHonestExt(path, res)
+			p := r.ensureHonestExt(ctx, path, res)
+			r.rememberSeen(ctx, p, size, mtime, h)
 			return
 		}
 	}
@@ -827,10 +869,14 @@ func (r *Runner) process(ctx context.Context, path string) {
 	// with a soundtrack glued on collapses into a photo (see media.
 	// StillVideo). Runs after idempotency checks so processed/skipped files
 	// never pay for probing; both witnesses must agree before we collapse.
-	still := res.Kind == detect.KindVideo && r.cfg.Still && r.hasFFmpeg &&
-		media.StillVideo(ctx, r.loc, path)
+	still := false
+	if res.Kind == detect.KindVideo && r.cfg.Still && r.hasFFmpeg {
+		// The pixel verification decodes the whole file: minutes on a long
+		// video, so the slot must say what is happening.
+		r.trackStage(rel, "still?")
+		still = media.StillVideo(ctx, r.loc, path)
+	}
 
-	rel := r.rel(path)
 	// If a journal row existed here, it was "nochange" with a changed settings
 	// stamp (the compressed outcome returns above): re-evaluating and failing
 	// to shrink again CONFIRMS the old decision, so it counts in `already`,
@@ -958,7 +1004,10 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 		r.addSize(path, path)
 		_ = r.store.MarkNoChange(ctx, srcHash, rel, res.Kind.String(), r.stampFor(res.Kind))
 		r.changes.record("not smaller", rel, rel, origSize, origSize, time.Since(t0).Seconds(), res.Kind.String(), mediaFormatFor(res, finalPath), "", encNote)
-		r.ensureHonestExt(path, res)
+		p := r.ensureHonestExt(ctx, path, res)
+		if oi, serr := os.Stat(p); serr == nil {
+			r.rememberSeen(ctx, p, oi.Size(), oi.ModTime().UnixNano(), srcHash)
+		}
 		return
 	}
 	if encErr != nil {
@@ -975,6 +1024,7 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 	// retries. ErrNoExiftool stays a warning: a deployment without exiftool
 	// still compresses, that is not the file's fault and not worth an error
 	// storm across every file.
+	r.trackStage(rel, "meta")
 	if err := meta.TransferTags(ctx, r.exif, path, tmp); err != nil {
 		if errors.Is(err, meta.ErrNoExiftool) {
 			r.logf("meta: exiftool not found, metadata may be lost: %s", rel)
@@ -1015,7 +1065,10 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 		r.addSize(path, path)
 		_ = r.store.MarkNoChange(ctx, srcHash, rel, res.Kind.String(), r.stampFor(res.Kind))
 		r.changes.record("not smaller", rel, rel, origInfo.Size(), newInfo.Size(), time.Since(t0).Seconds(), res.Kind.String(), mediaFormatFor(res, finalPath), "", encNote)
-		r.ensureHonestExt(path, res)
+		p := r.ensureHonestExt(ctx, path, res)
+		if oi, serr := os.Stat(p); serr == nil {
+			r.rememberSeen(ctx, p, oi.Size(), oi.ModTime().UnixNano(), srcHash)
+		}
 		return
 	}
 
@@ -1050,6 +1103,16 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 	// Uses the pre-swap capture so same-name swaps (mp4->mp4) stay honest too.
 	if err := meta.SetBirthTime(finalPath, srcBirth); err != nil {
 		r.logf("birthtime %s: %v", newRel, err)
+	}
+	// The new content is stable now: cache its triple so the next run skips the
+	// read. The rename carries an old key when the extension changed.
+	if path != finalPath {
+		if err := r.store.RenamePath(ctx, path, finalPath); err != nil {
+			r.logf("seen rename %s: %v", newRel, err)
+		}
+	}
+	if fi, serr := os.Stat(finalPath); serr == nil {
+		r.rememberSeen(ctx, finalPath, fi.Size(), fi.ModTime().UnixNano(), newHash)
 	}
 
 	// If we converted a file to a new extension, drop the old one (rename already
@@ -1087,26 +1150,28 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 // left by earlier tools' renames) are cleaned up the same way.
 // On a name collision the file is left untouched with a warning. DB
 // decisions are hash-based, so no stored-filename rewrite is required.
-// Call AFTER addSize (a rename would make the old path unstatable).
-func (r *Runner) ensureHonestExt(path string, res detect.Result) {
+// Call AFTER addSize (a rename would make the old path unstatable). Returns
+// the current path: the same one when nothing was renamed, the honest one
+// otherwise (the caller uses it to keep the seen cache in sync).
+func (r *Runner) ensureHonestExt(ctx context.Context, path string, res detect.Result) string {
 	if !res.ExtensionLies && !doubledMediaExt(path) {
-		return
+		return path
 	}
 	honest := res.Format.HonestExt()
 	if honest == "" {
-		return
+		return path
 	}
 	newPath := replaceExt(path, honest)
 	if newPath == path {
-		return
+		return path
 	}
 	if r.cfg.DryRun {
 		r.printBreak(func() { fmt.Printf("[dry-run] fix-ext: %s -> %s\n", r.rel(path), r.rel(newPath)) })
-		return
+		return path
 	}
 	if fileExists(newPath) {
 		r.logf("fix-ext %s: target %s already exists, keeping name", r.rel(path), r.rel(newPath))
-		return
+		return path
 	}
 	var sz int64
 	if fi, err := os.Stat(path); err == nil {
@@ -1115,10 +1180,16 @@ func (r *Runner) ensureHonestExt(path string, res detect.Result) {
 	if err := os.Rename(path, newPath); err != nil {
 		r.errored.Add(1)
 		r.logf("fix-ext %s: %v", r.rel(path), err)
-		return
+		return path
+	}
+	// The re-read cache follows the rename; otherwise the old key would linger
+	// forever and the new name would be hashed once for nothing.
+	if err := r.store.RenamePath(ctx, path, newPath); err != nil {
+		r.logf("seen rename %s: %v", r.rel(newPath), err)
 	}
 	r.fixedExt.Add(1)
 	r.changes.record("ext renamed", r.rel(path), r.rel(newPath), sz, sz, 0, res.Kind.String(), honest, "", "")
+	return newPath
 }
 
 func (r *Runner) fixExtOnly(path string, res detect.Result) {
@@ -1142,6 +1213,10 @@ func (r *Runner) fixExtOnly(path string, res detect.Result) {
 	// update stored filename mapping for the known hash
 	if h, err := hashFile(newPath); err == nil {
 		_ = r.store.MarkCompressed(context.Background(), h, r.rel(newPath), res.Kind.String(), "")
+		_ = r.store.RenamePath(context.Background(), path, newPath)
+		if fi, serr := os.Stat(newPath); serr == nil {
+			_ = r.store.RememberPath(context.Background(), newPath, fi.Size(), fi.ModTime().UnixNano(), h)
+		}
 	}
 	r.processed.Add(1)
 	r.addSize(path, newPath)
@@ -1295,7 +1370,12 @@ func hashFile(path string) (string, error) {
 	}
 	defer f.Close()
 	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
+	// 1 MiB reads instead of io.Copy's 32 KiB default: on the archive HDD the
+	// small buffer produced ~750 tiny reads/s per worker and 22 MB/s aggregate
+	// across 12 hashers (measured on the live run); large sequential reads
+	// let the drive stream instead of seek-thrash.
+	buf := make([]byte, 1<<20)
+	if _, err := io.CopyBuffer(h, f, buf); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
