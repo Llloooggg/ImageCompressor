@@ -108,3 +108,34 @@ func TestClip(t *testing.T) {
 		t.Errorf("clip split a rune: %q", got)
 	}
 }
+
+// A swap that took a NUMBERED name is not an error: the journal keeps exactly
+// one row for it ("compressed" with the "name taken:" Comment prefix). The
+// console notice must never be mirrored into the journal's error column - a
+// full archive run has ~100 numbered swaps and would otherwise fill the log
+// with fake errors. A real refusal (no name found) still journals an error.
+func TestNameTakenNoticeStaysOutOfTheErrorJournal(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "image_compressor.log")
+	cl, err := openChangeLog(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, _ := newTestRunner(t)
+	r.changes = cl
+
+	r.noticef("name taken %s: %s is owned by another file, writing %s", "dup.webp", "dup.avif", "dup (2).avif")
+	r.logf("name %s: no free honest name available near %s, file left untouched", "x.jpg", "x.avif")
+	cl.close()
+
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal := string(b)
+	if strings.Contains(journal, "name taken") {
+		t.Fatalf("the numbered-name notice leaked into the journal:\n%s", journal)
+	}
+	if !strings.Contains(journal, "\terror\t") || !strings.Contains(journal, "no free honest name") {
+		t.Fatalf("a real refusal must still be journaled as an error:\n%s", journal)
+	}
+}

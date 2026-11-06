@@ -1137,7 +1137,7 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 	nameTakenNote := ""
 	if !samePath(chosen, finalPath) {
 		nameTakenNote = "name taken: " + filepath.Base(finalPath) + " owned by another file; "
-		r.logf("name taken %s: %s is owned by another file, writing %s", rel, r.rel(finalPath), r.rel(chosen))
+		r.noticef("name taken %s: %s is owned by another file, writing %s", rel, r.rel(finalPath), r.rel(chosen))
 	}
 	finalPath = chosen
 	// NTFS creation time must be captured BEFORE the swap: when finalPath ==
@@ -1657,6 +1657,16 @@ func (r *Runner) logf(format string, v ...any) {
 		r.printBreak(func() { logf(r.cfg, format, v...) })
 	}
 	r.changes.record("error", "", "", 0, 0, 0, "", "", "", fmt.Sprintf(format, v...))
+}
+
+// r.noticef emits an INFORMATIONAL line (a numbered name was taken, etc.):
+// console only, never the journal. Only real anomalies belong in the journal's
+// error column — a swap that succeeded under a numbered name already has its
+// own row ("compressed" with the "name taken:" Comment prefix), so mirroring
+// the notice would fill the log with fake errors (~100 of them over the live
+// archive). printBreak keeps the live block intact in VT mode.
+func (r *Runner) noticef(format string, v ...any) {
+	r.printBreak(func() { fmt.Printf(format+"\n", v...) })
 }
 
 // printBreak safely emits a one-off console message (dry-run line, etc.) while
