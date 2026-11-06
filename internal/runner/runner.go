@@ -39,6 +39,7 @@ type Runner struct {
 	opts        media.Opts
 	videoOpts   media.Opts // video clone: fat thread slice + preset (see lanes)
 	vsem        chan struct{}
+	hsem        chan struct{} // big-file hash lanes: few concurrent cold reads
 	vchain      media.VideoChain
 	exif        string
 	processRoot string
@@ -109,6 +110,7 @@ func New(cfg *config.Config, st *store.Store, loc *tools.Locator) *Runner {
 		opts:       opts,
 		videoOpts:  videoOpts,
 		vsem:       make(chan struct{}, lanes),
+		hsem:       make(chan struct{}, bigHashLanes),
 		exif:       loc.Exiftool(),
 		hasAvifenc: loc.Avifenc() != "",
 		hasFFmpeg:  loc.FFmpeg() != "",
@@ -158,6 +160,38 @@ func (r *Runner) acquireLane(ctx context.Context, rel string) bool {
 		return true
 	case <-ctx.Done():
 		return false
+	}
+}
+
+const (
+	// bigHashThreshold: files at least this large are hashed through the
+	// big-file lanes. Below it (photos, short clips) a parallel read or two
+	// does not hurt a spindle.
+	bigHashThreshold = 64 << 20
+	// bigHashLanes: how many big files are read/hashed at once. The archive
+	// HDD measured ~22 MB/s aggregate with 12 concurrent readers (seek
+	// thrash, ~30 KB per read before the buffer fix); a few sequential
+	// streams let the head stream instead. Small files keep the full worker
+	// parallelism, and cache hits never take a lane.
+	bigHashLanes = 3
+)
+
+// acquireHashLane gates cold hashing of big files to a few concurrent reads.
+// The returned release MUST be called right after hashing — never held
+// through the encode (hashing and encoding are different bottlenecks). While
+// waiting the slot says "hash queued"; a stop request returns ok=false and
+// the file is left untouched for the next run.
+func (r *Runner) acquireHashLane(ctx context.Context, rel string, size int64) (release func(), ok bool) {
+	noop := func() {}
+	if size < bigHashThreshold {
+		return noop, true
+	}
+	r.trackStage(rel, "hash queued")
+	select {
+	case r.hsem <- struct{}{}:
+		return func() { <-r.hsem }, true
+	case <-ctx.Done():
+		return noop, false
 	}
 }
 
@@ -294,6 +328,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	r.vchain = r.opts.BuildVideoChain(avail)
 	fmt.Printf("Video encoders, mode %q: %s\n", r.opts.Encoder, chainString(r.vchain))
 	fmt.Printf("Heavy encodes (video/animated): %d lanes side by side, %d threads each\n", cap(r.vsem), r.videoOpts.CPUBudget)
+	fmt.Printf("Big-file hashing: %d at a time (>= %d MB), small files unrestricted\n", cap(r.hsem), bigHashThreshold>>20)
 	if r.cfg.Still {
 		fmt.Println("Still-image video collapse: on, one static frame with a soundtrack becomes a photo, use --no-still to keep such files as videos")
 	} else {
@@ -807,7 +842,7 @@ func (r *Runner) process(ctx context.Context, path string) {
 	}
 
 	if r.cfg.FixExt {
-		r.fixExtOnly(path, res)
+		r.fixExtOnly(ctx, path, res)
 		return
 	}
 
@@ -827,8 +862,13 @@ func (r *Runner) process(ctx context.Context, path string) {
 		}
 	}
 	if h == "" {
+		release, ok := r.acquireHashLane(ctx, rel, size)
+		if !ok {
+			return // stop requested while queued for a read lane; nothing touched
+		}
 		r.trackStage(rel, "hash")
 		h, err = hashFile(path)
+		release()
 		if err != nil {
 			r.errored.Add(1)
 			r.logf("hash %s: %v", path, err)
@@ -1192,7 +1232,7 @@ func (r *Runner) ensureHonestExt(ctx context.Context, path string, res detect.Re
 	return newPath
 }
 
-func (r *Runner) fixExtOnly(path string, res detect.Result) {
+func (r *Runner) fixExtOnly(ctx context.Context, path string, res detect.Result) {
 	if !res.ExtensionLies {
 		return
 	}
@@ -1210,12 +1250,23 @@ func (r *Runner) fixExtOnly(path string, res detect.Result) {
 		r.logf("fix-ext %s: %v", r.rel(path), err)
 		return
 	}
-	// update stored filename mapping for the known hash
-	if h, err := hashFile(newPath); err == nil {
-		_ = r.store.MarkCompressed(context.Background(), h, r.rel(newPath), res.Kind.String(), "")
-		_ = r.store.RenamePath(context.Background(), path, newPath)
-		if fi, serr := os.Stat(newPath); serr == nil {
-			_ = r.store.RememberPath(context.Background(), newPath, fi.Size(), fi.ModTime().UnixNano(), h)
+	// update stored filename mapping for the known hash (a mass --fix-ext run
+	// over the archive still reads every file: big ones go through the read
+	// lanes so they do not thrash the disk)
+	var size int64 = -1
+	if fi, serr := os.Stat(newPath); serr == nil {
+		size = fi.Size()
+	}
+	release, ok := r.acquireHashLane(ctx, r.rel(newPath), size)
+	if ok {
+		h, herr := hashFile(newPath)
+		release()
+		if herr == nil {
+			_ = r.store.MarkCompressed(context.Background(), h, r.rel(newPath), res.Kind.String(), "")
+			_ = r.store.RenamePath(context.Background(), path, newPath)
+			if fi, serr := os.Stat(newPath); serr == nil {
+				_ = r.store.RememberPath(context.Background(), newPath, fi.Size(), fi.ModTime().UnixNano(), h)
+			}
 		}
 	}
 	r.processed.Add(1)

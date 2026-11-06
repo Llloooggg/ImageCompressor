@@ -419,3 +419,69 @@ func TestEnsureHonestExt_DoubledExt_Cleaned(t *testing.T) {
 		t.Fatalf("fixedExt = %d, want 1", r.fixedExt.Load())
 	}
 }
+
+// Cold hashing of big files must not read them all at once: the archive HDD
+// thrashed at ~22 MB/s with 12 concurrent hashers (seek thrash). Small files
+// and cache hits never wait for a read lane; a stop request must not block.
+func TestHashLane_BigFilesOnly(t *testing.T) {
+	r, _ := newTestRunner(t)
+	ctx := context.Background()
+
+	drain := func() {
+		for {
+			select {
+			case <-r.hsem:
+			default:
+				return
+			}
+		}
+	}
+	fill := func() {
+		for i := 0; i < cap(r.hsem); i++ {
+			r.hsem <- struct{}{}
+		}
+	}
+	t.Cleanup(drain)
+	fill()
+
+	// Small files ignore the lanes entirely.
+	release, ok := r.acquireHashLane(ctx, "small", bigHashThreshold-1)
+	if !ok {
+		t.Fatal("small file must not wait for a lane")
+	}
+	release()
+
+	// A big file waits while every lane is taken.
+	done := make(chan bool, 1)
+	go func() {
+		rel, ok := r.acquireHashLane(ctx, "big", bigHashThreshold)
+		if ok {
+			rel()
+		}
+		done <- ok
+	}()
+	select {
+	case <-done:
+		t.Fatal("big file should wait while all lanes are busy")
+	case <-time.After(50 * time.Millisecond):
+	}
+	<-r.hsem // free exactly one lane
+	select {
+	case ok := <-done:
+		if !ok {
+			t.Fatal("big file must acquire after a lane is freed")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("big file did not proceed after a lane was freed")
+	}
+
+	// Cancelled wait: all lanes busy + ctx already done -> no blocking read.
+	drain()
+	fill()
+	ctxStop, cancel := context.WithCancel(ctx)
+	cancel()
+	if rel, ok := r.acquireHashLane(ctxStop, "big", bigHashThreshold); ok {
+		rel()
+		t.Fatal("cancelled wait must report ok=false")
+	}
+}
