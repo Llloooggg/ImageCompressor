@@ -1,4 +1,4 @@
-// Command mediacompressor compresses a family photo/video archive to canonical
+// Command ImageCompressor compresses a family photo/video archive to canonical
 // formats (photo/animated -> AVIF, video -> MP4+AV1) with metadata preserved,
 // idempotently and crash-safely. Defaults are chosen so that running with no
 // arguments compresses the executable's own folder recursively.

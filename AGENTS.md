@@ -103,8 +103,8 @@
 
 ## Сборка / проверки
 
-- `go build -o dist/image_compressor.exe ./cmd/mediacompressor` (Windows)
-- кросс-сборка: `$env:GOOS="linux"; $env:CGO_ENABLED="0"; go build -o dist/image_compressor ./cmd/mediacompressor`
+- `go build -o dist/image_compressor.exe ./cmd/ImageCompressor` (Windows)
+- кросс-сборка: `$env:GOOS="linux"; $env:CGO_ENABLED="0"; go build -o dist/image_compressor ./cmd/ImageCompressor`
 - обязательно перед коммитом: `go vet ./...` и `go test ./...`
 - PowerShell: `CGO_ENABLED=0 ...` НЕ работает как префикс — пиши `$env:CGO_ENABLED="0"; go ...`
 
@@ -177,7 +177,7 @@
 - ГОТОВО (сборка win+linux, vet, тесты зелёные): `internal/detect`, `internal/safefs`,
   `internal/store`, `internal/tools`, `internal/meta`, `internal/media` (+still.go — детект
   шляп), `internal/vt` (ANSI-режим консоли), `internal/runner`,
-  `internal/config`, `cmd/mediacompressor`.
+  `internal/config`, `cmd/ImageCompressor`.
 - Старая Python-реализация удалена из дерева (осталась только в git-истории). Её SQLite
   `image_compressor.db` **живёт в архиве пользователя** — Go принимает её как есть
   (таблица `processed_images(hash, filename)`, колонки добавляет `ALTER`-ями).
