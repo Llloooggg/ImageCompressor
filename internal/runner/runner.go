@@ -57,6 +57,13 @@ type Runner struct {
 	observedMu sync.Mutex          // guards observed (end-of-run journal GC)
 	observed   map[string]struct{} // every content hash this walk laid eyes on
 
+	// claims reserves honest output names for the duration of one swap.
+	// Two source files can want the same name ("a.jpg" + "a.webp" copies,
+	// "a.jpg" + "A.PNG" on a case-insensitive filesystem); without a claim a
+	// rename would overwrite the other file's output and remove its source.
+	claimMu sync.Mutex
+	claims  map[string]bool
+
 	multi     bool        // VT fixed-height status block: counters + per-worker rows
 	firstDraw atomic.Bool // first VT repaint of this run
 	statusVis bool        // live block is currently on screen (guarded by statusMu)
@@ -115,7 +122,43 @@ func New(cfg *config.Config, st *store.Store, loc *tools.Locator) *Runner {
 		hasAvifenc: loc.Avifenc() != "",
 		hasFFmpeg:  loc.FFmpeg() != "",
 		observed:   map[string]struct{}{},
+		claims:     map[string]bool{},
 	}
+}
+
+// claimTarget reserves the honest target name for one swap and reports whether
+// this file may take it. Same-name swaps (mp4 -> mp4) replace our own source
+// and always pass. Otherwise the name must be free: neither on disk (an output
+// of another source file) nor claimed by another worker right now. Windows
+// names fold case, so the claim key does too there.
+//
+// The caller must run release() when the swap is finished (or abandoned).
+func (r *Runner) claimTarget(src, target string) (release func(), ok bool) {
+	noop := func() {}
+	if src == target {
+		return noop, true
+	}
+	key := target
+	if runtime.GOOS == "windows" {
+		key = strings.ToLower(key)
+	}
+	r.claimMu.Lock()
+	if r.claims[key] {
+		r.claimMu.Unlock()
+		return noop, false
+	}
+	r.claims[key] = true
+	r.claimMu.Unlock()
+	release = func() {
+		r.claimMu.Lock()
+		delete(r.claims, key)
+		r.claimMu.Unlock()
+	}
+	if fileExists(target) {
+		release()
+		return noop, false
+	}
+	return release, true
 }
 
 // DefaultVideoLanes: how many heavy video encodes run side by side by auto.
@@ -269,6 +312,16 @@ func (r *Runner) Recover(ctx context.Context) error {
 			}
 		case fileExists(s.TmpPath):
 			if h, err := hashFile(s.TmpPath); err == nil && h == s.ExpectedHash {
+				if fileExists(s.FinalPath) {
+					// The honest name is occupied by something that is NOT our
+					// output (its hash did not match above): never swallow it.
+					// The staged swap is dropped; the source is still on disk
+					// (the rename never happened) and gets reprocessed.
+					safefs.RemoveIfExists(s.TmpPath)
+					_ = r.store.DropStaged(ctx, s.ID)
+					log.Printf("recover %s: target taken by another file, swap dropped", s.FinalPath)
+					continue
+				}
 				// rename never happened — finish it safely
 				if err := safefs.AtomicReplace(s.TmpPath, s.FinalPath); err != nil {
 					return err
@@ -956,6 +1009,26 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 		res.Format = detect.FmtAVIF
 	}
 	finalPath := r.finalPath(path, res) // honest extension target
+	// Never let a rename swallow a DIFFERENT file. Two sources can want one
+	// honest name ("a.jpg" + "a.webp" copies, "a.jpg" + "A.PNG" on a
+	// case-insensitive filesystem): before this guard the later swap
+	// overwrote the other file's output and removed its source (89 files
+	// consumed in the FData archive). Refused BEFORE encoding, so both
+	// originals stay exactly as they are; nothing is written to the journal
+	// either, so if the rival disappears later this file compresses fine.
+	if releaseTarget, ok := r.claimTarget(path, finalPath); !ok {
+		r.skipNotSmaller.Add(1)
+		var sz int64
+		if fi, serr := os.Stat(path); serr == nil {
+			sz = fi.Size()
+		}
+		r.addSize(path, path)
+		r.logf("name collision %s: %s is taken by another file, both originals kept", rel, r.rel(finalPath))
+		r.changes.record("name collision", rel, r.rel(finalPath), sz, sz, time.Since(t0).Seconds(), res.Kind.String(), mediaFormatFor(res, finalPath), "", "honest name taken by another file: nothing touched")
+		return
+	} else {
+		defer releaseTarget()
+	}
 	// NTFS creation time must be captured BEFORE the swap: when finalPath ==
 	// path (same-name replace, e.g. mp4->mp4) the original is gone by the
 	// time we would otherwise read it back (the swap left the temp's birth).
@@ -1043,7 +1116,7 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 		}
 		r.addSize(path, path)
 		_ = r.store.MarkNoChange(ctx, srcHash, rel, res.Kind.String(), r.stampFor(res.Kind))
-		r.changes.record("not smaller", rel, rel, origSize, origSize, time.Since(t0).Seconds(), res.Kind.String(), mediaFormatFor(res, finalPath), "", encNote)
+		r.changes.record("not smaller", rel, rel, origSize, origSize, time.Since(t0).Seconds(), res.Kind.String(), mediaFormatFor(res, finalPath), "", hatNote(encNote, still))
 		p := r.ensureHonestExt(ctx, path, res)
 		if oi, serr := os.Stat(p); serr == nil {
 			r.rememberSeen(ctx, p, oi.Size(), oi.ModTime().UnixNano(), srcHash)
@@ -1104,7 +1177,7 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 		}
 		r.addSize(path, path)
 		_ = r.store.MarkNoChange(ctx, srcHash, rel, res.Kind.String(), r.stampFor(res.Kind))
-		r.changes.record("not smaller", rel, rel, origInfo.Size(), newInfo.Size(), time.Since(t0).Seconds(), res.Kind.String(), mediaFormatFor(res, finalPath), "", encNote)
+		r.changes.record("not smaller", rel, rel, origInfo.Size(), newInfo.Size(), time.Since(t0).Seconds(), res.Kind.String(), mediaFormatFor(res, finalPath), "", hatNote(encNote, still))
 		p := r.ensureHonestExt(ctx, path, res)
 		if oi, serr := os.Stat(p); serr == nil {
 			r.rememberSeen(ctx, p, oi.Size(), oi.ModTime().UnixNano(), srcHash)
@@ -1209,9 +1282,13 @@ func (r *Runner) ensureHonestExt(ctx context.Context, path string, res detect.Re
 		r.printBreak(func() { fmt.Printf("[dry-run] fix-ext: %s -> %s\n", r.rel(path), r.rel(newPath)) })
 		return path
 	}
-	if fileExists(newPath) {
+	// The same collision guard as the swap: a rename must never swallow a
+	// different file that already owns the honest name.
+	if release, ok := r.claimTarget(path, newPath); !ok {
 		r.logf("fix-ext %s: target %s already exists, keeping name", r.rel(path), r.rel(newPath))
 		return path
+	} else {
+		defer release()
 	}
 	var sz int64
 	if fi, err := os.Stat(path); err == nil {
@@ -1244,6 +1321,14 @@ func (r *Runner) fixExtOnly(ctx context.Context, path string, res detect.Result)
 	if r.cfg.DryRun {
 		r.printBreak(func() { fmt.Printf("[dry-run] fix-ext: %s -> %s\n", r.rel(path), r.rel(newPath)) })
 		return
+	}
+	// Collision guard: --fix-ext must never rename one file on top of another
+	// that already owns the honest name (the same swallow the swap guard fixes).
+	if release, ok := r.claimTarget(path, newPath); !ok {
+		r.logf("fix-ext %s: target %s already exists, keeping name", r.rel(path), r.rel(newPath))
+		return
+	} else {
+		defer release()
 	}
 	if err := os.Rename(path, newPath); err != nil {
 		r.errored.Add(1)
@@ -1535,6 +1620,19 @@ func (r *Runner) achievedFor(k detect.Kind, v media.VideoResult, p media.PhotoRe
 	default:
 		return ""
 	}
+}
+
+// hatNote marks a "not smaller" verdict that came from a video hat: the Kind
+// column says "image" (the collapse rewrites it), which would otherwise read as
+// if the file had always been a photo.
+func hatNote(note string, still bool) string {
+	if !still {
+		return note
+	}
+	if note == "" {
+		return "hat: one kept frame not smaller than the clip"
+	}
+	return "hat: " + note
 }
 
 // attemptsComment joins the encoder audit trail (every encode + VMAF pass with

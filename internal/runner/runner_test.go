@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -483,5 +484,59 @@ func TestHashLane_BigFilesOnly(t *testing.T) {
 	if rel, ok := r.acquireHashLane(ctxStop, "big", bigHashThreshold); ok {
 		rel()
 		t.Fatal("cancelled wait must report ok=false")
+	}
+}
+
+// Two DIFFERENT sources must never take one honest name. The FData archive
+// lost 89 files this way ("a.jpg" + "a.webp" copies, "a.jpg" + "A.PNG" on a
+// case-insensitive filesystem): the later swap overwrote the first output and
+// removed its source. The claim makes the refusal explicit.
+func TestClaimTarget_NeverOverwritesAnotherFile(t *testing.T) {
+	r, _ := newTestRunner(t)
+
+	taken := filepath.Join(r.processRoot, "x.avif")
+	if err := os.WriteFile(taken, []byte("someone else's output"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if rel, ok := r.claimTarget(filepath.Join(r.processRoot, "x.jpg"), taken); ok {
+		rel()
+		t.Fatal("a target owned by another file must be refused")
+	}
+
+	// A same-name swap (mp4 -> mp4) replaces its own source: always allowed.
+	self := filepath.Join(r.processRoot, "y.mp4")
+	if rel, ok := r.claimTarget(self, self); !ok {
+		rel()
+		t.Fatal("same-name swap must be allowed")
+	}
+
+	// Free name: claimable once; a second worker asking for it loses until the
+	// first releases.
+	free := filepath.Join(r.processRoot, "z.avif")
+	rel1, ok := r.claimTarget(filepath.Join(r.processRoot, "z.png"), free)
+	if !ok {
+		t.Fatal("a free target must be claimable")
+	}
+	if rel2, ok := r.claimTarget(filepath.Join(r.processRoot, "z.webp"), free); ok {
+		rel2()
+		t.Fatal("a target claimed by another worker must be refused")
+	}
+	rel1()
+	rel3, ok := r.claimTarget(filepath.Join(r.processRoot, "z.webp"), free)
+	if !ok {
+		t.Fatal("a released target must be claimable again")
+	}
+	rel3()
+
+	if runtime.GOOS == "windows" {
+		// NTFS folds case: IMAGE.PNG and image.jpg both want image.avif.
+		upper := filepath.Join(r.processRoot, "CASE.avif")
+		if err := os.WriteFile(upper, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if rel, ok := r.claimTarget(filepath.Join(r.processRoot, "case.png"), filepath.Join(r.processRoot, "case.avif")); ok {
+			rel()
+			t.Fatal("case-only collision must be refused on Windows")
+		}
 	}
 }
