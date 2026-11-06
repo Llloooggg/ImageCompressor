@@ -208,8 +208,10 @@ func TestProcess_NoChange_LyingExt_StillRenamed(t *testing.T) {
 	}
 }
 
-// Collision with an existing honest name -> keep the file, warn, no rename.
-func TestEnsureHonestExt_Collision_KeepsFile(t *testing.T) {
+// An honest name owned by a DIFFERENT file must not be taken over, and the lie
+// must still be fixed (canon: honesty always): the liar moves to a numbered
+// honest name and both files survive.
+func TestEnsureHonestExt_Collision_TakesNumberedHonestName(t *testing.T) {
 	ctx := context.Background()
 	r, _ := newTestRunner(t)
 
@@ -227,15 +229,28 @@ func TestEnsureHonestExt_Collision_KeepsFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r.ensureHonestExt(ctx, liar, res)
+	got := r.ensureHonestExt(ctx, liar, res)
 
-	if _, err := os.Stat(liar); err != nil {
-		t.Fatal("colliding file must stay in place")
+	if got == liar || got == honest {
+		t.Fatalf("want a numbered honest name, got %s", filepath.Base(got))
 	}
-	if r.fixedExt.Load() != 0 {
-		t.Fatalf("fixedExt = %d, want 0 on collision", r.fixedExt.Load())
+	if base := filepath.Base(got); base != "same (2).jpg" {
+		t.Fatalf("want same (2).jpg, got %s", base)
 	}
-	_ = ctx
+	if _, err := os.Stat(got); err != nil {
+		t.Fatalf("the renamed honest file must exist: %v", err)
+	}
+	if _, err := os.Stat(liar); !os.IsNotExist(err) {
+		t.Fatal("the lying name must be gone after the rename")
+	}
+	// The other file is untouched, byte for byte.
+	data, err := os.ReadFile(honest)
+	if err != nil || string(data) != "real photo" {
+		t.Fatalf("the rival's file was damaged: %q %v", data, err)
+	}
+	if r.fixedExt.Load() != 1 {
+		t.Fatalf("fixedExt = %d, want 1 (honesty was fixed)", r.fixedExt.Load())
+	}
 }
 
 // Output mode must be a FULL mirror: non-media files land in the output too,
@@ -487,56 +502,153 @@ func TestHashLane_BigFilesOnly(t *testing.T) {
 	}
 }
 
-// Two DIFFERENT sources must never take one honest name. The FData archive
-// lost 89 files this way ("a.jpg" + "a.webp" copies, "a.jpg" + "A.PNG" on a
-// case-insensitive filesystem): the later swap overwrote the first output and
-// removed its source. The claim makes the refusal explicit.
-func TestClaimTarget_NeverOverwritesAnotherFile(t *testing.T) {
+// One honest name must never be wanted by two different files: the FData
+// archive lost 274 files that way (160 of them photos replaced by a frame
+// pulled out of a same-named clip). claimTarget reserves the honest name when
+// it is free and a NUMBERED name when a rival owns it, so both sources still
+// get compressed and neither file is ever overwritten.
+func TestClaimTarget_NumberedNameInsteadOfOverwrite(t *testing.T) {
 	r, _ := newTestRunner(t)
+	root := r.processRoot
 
-	taken := filepath.Join(r.processRoot, "x.avif")
+	taken := filepath.Join(root, "x.avif")
 	if err := os.WriteFile(taken, []byte("someone else's output"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if rel, ok := r.claimTarget(filepath.Join(r.processRoot, "x.jpg"), taken); ok {
-		rel()
-		t.Fatal("a target owned by another file must be refused")
+	src1 := filepath.Join(root, "x.jpg")
+	chosen1, release1 := r.claimTarget(src1, taken)
+	if chosen1 == taken {
+		release1()
+		t.Fatal("a name owned by another file must not be claimed")
+	}
+	defer release1()
+	if got := filepath.Base(chosen1); got != "x (2).avif" {
+		t.Fatalf("want the numbered honest name x (2).avif, got %s", got)
 	}
 
-	// A same-name swap (mp4 -> mp4) replaces its own source: always allowed.
-	self := filepath.Join(r.processRoot, "y.mp4")
-	if rel, ok := r.claimTarget(self, self); !ok {
-		rel()
-		t.Fatal("same-name swap must be allowed")
+	// Same stem, second source in flight: it must not take the first one's
+	// numbered name either (that would swallow the in-flight output).
+	src2 := filepath.Join(root, "x.webp")
+	chosen2, release2 := r.claimTarget(src2, taken)
+	if release2 != nil {
+		defer release2()
+	}
+	if got := filepath.Base(chosen2); got != "x (3).avif" {
+		t.Fatalf("a concurrent claim must move on to x (3).avif, got %s", got)
 	}
 
-	// Free name: claimable once; a second worker asking for it loses until the
-	// first releases.
-	free := filepath.Join(r.processRoot, "z.avif")
-	rel1, ok := r.claimTarget(filepath.Join(r.processRoot, "z.png"), free)
-	if !ok {
-		t.Fatal("a free target must be claimable")
+	// A same-name swap (mp4 -> mp4) replaces its own source: no numbering.
+	self := filepath.Join(root, "y.mp4")
+	if chosen, release := r.claimTarget(self, self); chosen != self {
+		release()
+		t.Fatalf("same-name swap must keep its own name, got %s", chosen)
+	} else {
+		release()
 	}
-	if rel2, ok := r.claimTarget(filepath.Join(r.processRoot, "z.webp"), free); ok {
-		rel2()
-		t.Fatal("a target claimed by another worker must be refused")
+
+	// A released name is reusable: after the first swap lands, the next
+	// claimant of the free honest name gets the honest name, not a number.
+	free := filepath.Join(root, "z.avif")
+	chosenA, releaseA := r.claimTarget(filepath.Join(root, "z.png"), free)
+	if filepath.Base(chosenA) != "z.avif" {
+		releaseA()
+		t.Fatalf("a free target must be claimed as-is, got %s", chosenA)
 	}
-	rel1()
-	rel3, ok := r.claimTarget(filepath.Join(r.processRoot, "z.webp"), free)
-	if !ok {
-		t.Fatal("a released target must be claimable again")
+	releaseA()
+	if err := os.WriteFile(free, []byte("our output"), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	rel3()
+	chosenB, releaseB := r.claimTarget(filepath.Join(root, "z.webp"), free)
+	defer releaseB()
+	if got := filepath.Base(chosenB); got != "z (2).avif" {
+		t.Fatalf("after the honest name landed, want z (2).avif, got %s", got)
+	}
 
 	if runtime.GOOS == "windows" {
 		// NTFS folds case: IMAGE.PNG and image.jpg both want image.avif.
-		upper := filepath.Join(r.processRoot, "CASE.avif")
+		upper := filepath.Join(root, "CASE.avif")
 		if err := os.WriteFile(upper, []byte("x"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		if rel, ok := r.claimTarget(filepath.Join(r.processRoot, "case.png"), filepath.Join(r.processRoot, "case.avif")); ok {
-			rel()
-			t.Fatal("case-only collision must be refused on Windows")
+		chosen, release := r.claimTarget(filepath.Join(root, "case.png"), filepath.Join(root, "case.avif"))
+		defer release()
+		if samePath(chosen, upper) {
+			t.Fatal("a case-only collision with another file must be given a numbered name")
 		}
+		if got := filepath.Base(chosen); got != "case (2).avif" {
+			t.Fatalf("want case (2).avif on a case-folded clash, got %s", got)
+		}
+
+		// clip.MP4 -> clip.mp4 is the SAME file (case-only honesty fix), not a
+		// clash: no numbering, no second file. Getting this wrong is how an
+		// uppercase-extension clip lost its own fresh output.
+		upperSrc := filepath.Join(root, "UPPER.MP4")
+		if err := os.WriteFile(upperSrc, []byte("clip"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		chosen2, release2 := r.claimTarget(upperSrc, filepath.Join(root, "upper.mp4"))
+		defer release2()
+		if !samePath(chosen2, upperSrc) {
+			t.Fatalf("case-only same-file target must stay itself, got %s", chosen2)
+		}
+	}
+}
+
+// stemTwins is the name-jam map gather builds. It answers "does another file
+// want this output name" — by NAME only, never by type (canon: classification
+// stays magic-bytes-only, like videosLast queueing by suffix).
+func TestStemTwinsDetectNameJams(t *testing.T) {
+	r, _ := newTestRunner(t)
+	root := r.processRoot
+	for _, name := range []string{
+		`people\x.jpg`, `people\x.mp4`, // photo + its "hat" clip: the deadly pair
+		`people\y.avif`, `people\y.mp4`,
+		`people\chain.mp4.mov`, `people\chain.jpg`,
+		`docs\note.txt`, `docs\note.mp4`, // a text sibling is not a rival
+	} {
+		r.countStem(filepath.Join(root, filepath.FromSlash(name)), root)
+	}
+	yes := []string{`people\x.jpg`, `people\x.mp4`, `people\y.avif`, `people\chain.mp4.mov`, `people\chain.jpg`}
+	for _, name := range yes {
+		if !r.hasStemTwin(filepath.Join(root, filepath.FromSlash(name))) {
+			t.Errorf("%s: expected a same-name twin", name)
+		}
+	}
+	no := []string{`docs\note.mp4`, `people\solo.jpg`}
+	for _, name := range no {
+		if r.hasStemTwin(filepath.Join(root, filepath.FromSlash(name))) {
+			t.Errorf("%s: expected no twin", name)
+		}
+	}
+}
+
+// The settings stamp of a "could not shrink" verdict must be the one the
+// idempotency check will recompute for the kind the BYTES report. A "hat"
+// collapse rewrites the kind to image, so stamping the rewritten kind wrote a
+// row that could never match again and the file was re-encoded on every run
+// (battle: azart_zay\azart_zay-20230407-0001.mp4 in every journal section).
+func TestNoChangeStampMatchesTheKindTheCheckUses(t *testing.T) {
+	ctx := context.Background()
+	r, st := newTestRunner(t)
+	const h = "hat-clip-hash"
+	const rel = `azart_zay\azart_zay-20230407-0001.mp4`
+
+	// What encodeSwap now writes for a refused hat: the ORIGINAL kind's stamp.
+	if err := st.MarkNoChange(ctx, h, rel, detect.KindVideo.String(), r.stampFor(detect.KindVideo)); err != nil {
+		t.Fatal(err)
+	}
+	rec, processed, err := st.IsProcessed(ctx, h)
+	if err != nil || !processed {
+		t.Fatalf("row must exist: processed=%v err=%v", processed, err)
+	}
+	// process() asks with the detected kind (a .mp4 is video).
+	if rec.Stamp != r.stampFor(detect.KindVideo) {
+		t.Fatalf("stamp must match the detected kind, got %q want %q", rec.Stamp, r.stampFor(detect.KindVideo))
+	}
+
+	// The old bug for contrast: an image-kind stamp can never match, which is
+	// exactly the per-run re-encode loop.
+	if r.stampFor(detect.KindImage) == r.stampFor(detect.KindVideo) {
+		t.Fatal("photo and video stamps must differ, or the loop was never real")
 	}
 }

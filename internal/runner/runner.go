@@ -64,6 +64,11 @@ type Runner struct {
 	claimMu sync.Mutex
 	claims  map[string]bool
 
+	// stemTwins counts how many media files the walk found under one honest
+	// name stem in the same folder. Count >= 2 means two files want one output
+	// name. Filled by gather, read-only while workers run.
+	stemTwins map[string]int
+
 	multi     bool        // VT fixed-height status block: counters + per-worker rows
 	firstDraw atomic.Bool // first VT repaint of this run
 	statusVis bool        // live block is currently on screen (guarded by statusMu)
@@ -123,42 +128,125 @@ func New(cfg *config.Config, st *store.Store, loc *tools.Locator) *Runner {
 		hasFFmpeg:  loc.FFmpeg() != "",
 		observed:   map[string]struct{}{},
 		claims:     map[string]bool{},
+		stemTwins:  map[string]int{},
 	}
 }
 
-// claimTarget reserves the honest target name for one swap and reports whether
-// this file may take it. Same-name swaps (mp4 -> mp4) replace our own source
-// and always pass. Otherwise the name must be free: neither on disk (an output
-// of another source file) nor claimed by another worker right now. Windows
-// names fold case, so the claim key does too there.
+// stemKey is the identity our naming rules give a file: its folder plus its
+// name with the trailing (and chained) media extensions removed, case-folded
+// where the filesystem folds case. Every file sharing a key gets the same
+// finalPath ("x.jpg" and "x.mp4" both want "x.avif"), so a count above one
+// means a name fight.
 //
-// The caller must run release() when the swap is finished (or abandoned).
-func (r *Runner) claimTarget(src, target string) (release func(), ok bool) {
-	noop := func() {}
-	if src == target {
-		return noop, true
+// This reads SUFFIXES on purpose: output names are a suffix game. It never
+// decides what a file IS — classification and honesty stay magic-bytes-only
+// (canon), exactly like videosLast which only queues by extension.
+func stemKey(path string) string {
+	stem := filepath.Base(path)
+	for {
+		e := filepath.Ext(stem)
+		if e == "" || !detect.IsMediaExt(e) {
+			break
+		}
+		t := stem[:len(stem)-len(e)]
+		if t == "" {
+			break
+		}
+		stem = t
 	}
-	key := target
+	key := stem
 	if runtime.GOOS == "windows" {
 		key = strings.ToLower(key)
 	}
+	return filepath.Join(filepath.Dir(path), key)
+}
+
+// countStem records one walked file under its name stem, keyed RELATIVE to the
+// walked root so the same file seen through the --output mirror lands on the
+// same key (the mirror keeps the relative layout). Only media-suffixed files
+// are counted: they are the ones that can claim an output name (a same-named
+// "x.txt" is not a rival). Gather time only.
+func (r *Runner) countStem(path, walkRoot string) {
+	if !detect.IsMediaExt(filepath.Ext(path)) {
+		return
+	}
+	rel, err := filepath.Rel(walkRoot, path)
+	if err != nil {
+		rel = filepath.Base(path)
+	}
+	r.stemTwins[stemKey(rel)]++
+}
+
+// hasStemTwin reports whether another walked file in the same folder wants the
+// same honest output name as this one (same stem under processRoot).
+func (r *Runner) hasStemTwin(path string) bool {
+	return r.stemTwins[stemKey(r.rel(path))] >= 2
+}
+
+// samePath compares paths the way the filesystem does them. On Windows
+// "clip.MP4" and "clip.mp4" are ONE file, not two. Treating them as two is how
+// an uppercase-extension clip lost its own fresh output: the swap renamed the
+// file in place, then RemoveIfExists on the "old" name deleted the result.
+func samePath(a, b string) bool {
+	if a == b {
+		return true
+	}
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(a, b)
+	}
+	return false
+}
+
+// maxNameAttempts bounds the numbered-name search. Reaching it means the
+// folder holds 64 same-stem media files: we stop rather than rename forever.
+const maxNameAttempts = 64
+
+// claimTarget reserves a writable honest name for one swap and returns it.
+//
+// The requested honest name is preferred. When that name is already owned by a
+// DIFFERENT file — two sources with one stem ("a.jpg" + "a.webp" copies,
+// "a.jpg" + "A.PNG" on a case-insensitive filesystem, or a "hat" clip whose
+// extracted frame wants the photo's name) — the rival's name is NOT taken
+// over: a numbered name is reserved instead ("a (2).avif"). The reservation
+// happens BEFORE encoding because safefs.AtomicReplace overwrites
+// unconditionally: the FData archive lost 274 files (160 of them photos
+// replaced by a frame pulled out of a same-named clip) once two sources were
+// allowed to want one name.
+//
+// A same-name swap ("clip.mp4" -> "clip.mp4") replaces its own source and
+// always passes. The caller must run release() when the swap is finished (or
+// abandoned). chosen == "" means no name could be reserved.
+func (r *Runner) claimTarget(src, target string) (chosen string, release func()) {
+	noop := func() {}
+	if samePath(src, target) {
+		return target, noop
+	}
+	dir := filepath.Dir(target)
+	base := filepath.Base(target)
+	ext := filepath.Ext(base)
+	stem := base[:len(base)-len(ext)]
 	r.claimMu.Lock()
-	if r.claims[key] {
-		r.claimMu.Unlock()
-		return noop, false
+	defer r.claimMu.Unlock()
+	for n := 1; n <= maxNameAttempts; n++ {
+		cand := target
+		if n > 1 {
+			cand = filepath.Join(dir, fmt.Sprintf("%s (%d)%s", stem, n, ext))
+		}
+		key := cand
+		if runtime.GOOS == "windows" {
+			key = strings.ToLower(key)
+		}
+		if r.claims[key] || fileExists(cand) {
+			continue
+		}
+		r.claims[key] = true
+		return cand, func() {
+			r.claimMu.Lock()
+			delete(r.claims, key)
+			r.claimMu.Unlock()
+		}
 	}
-	r.claims[key] = true
-	r.claimMu.Unlock()
-	release = func() {
-		r.claimMu.Lock()
-		delete(r.claims, key)
-		r.claimMu.Unlock()
-	}
-	if fileExists(target) {
-		release()
-		return noop, false
-	}
-	return release, true
+	return "", noop
 }
 
 // DefaultVideoLanes: how many heavy video encodes run side by side by auto.
@@ -790,6 +878,7 @@ func (r *Runner) gather(ctx context.Context) ([]string, error) {
 		if fi, ierr := d.Info(); ierr == nil {
 			r.scanBytes.Add(fi.Size()) // feeds the byte-based ETA in the live status
 		}
+		r.countStem(p, src) // name-jam map: who else wants this output name
 		out = append(out, p)
 		return nil
 	})
@@ -962,8 +1051,16 @@ func (r *Runner) process(ctx context.Context, path string) {
 	// with a soundtrack glued on collapses into a photo (see media.
 	// StillVideo). Runs after idempotency checks so processed/skipped files
 	// never pay for probing; both witnesses must agree before we collapse.
+	//
+	// A same-stem sibling blocks the collapse: if the folder already holds
+	// "x.jpg" (or "x.png"/"x.webp") next to "x.mp4", that photo IS the picture
+	// the clip would contribute, and the frame would want the photo's own
+	// honest name. Collapsing there duplicated the picture and — before names
+	// were claimed — overwrote the compressed photo: 160 of the 274 files the
+	// live archive lost died exactly this way. Such clips now run the normal
+	// video ladder (or stay as they are if AV1 cannot beat them).
 	still := false
-	if res.Kind == detect.KindVideo && r.cfg.Still && r.hasFFmpeg {
+	if res.Kind == detect.KindVideo && r.cfg.Still && r.hasFFmpeg && !r.hasStemTwin(path) {
 		// The pixel verification decodes the whole file: minutes on a long
 		// video, so the slot must say what is happening.
 		r.trackStage(rel, "still?")
@@ -978,13 +1075,18 @@ func (r *Runner) process(ctx context.Context, path string) {
 
 	// Dry run: just report what would change.
 	if r.cfg.DryRun {
-		target := filepath.Base(r.finalPath(path, res))
-		note := ""
+		target := r.finalPath(path, res)
 		if still {
 			target = replaceExt(target, detect.FmtAVIF.HonestExt())
+		}
+		note := ""
+		if still {
 			note = ", collapse still-image video to photo"
 		}
-		r.printBreak(func() { fmt.Printf("[dry-run] %s -> %s%s\n", rel, target, note) })
+		if !samePath(target, path) && fileExists(target) {
+			note += ", honest name owned by another file -> numbered name instead"
+		}
+		r.printBreak(func() { fmt.Printf("[dry-run] %s -> %s%s\n", rel, filepath.Base(target), note) })
 		return
 	}
 
@@ -1000,6 +1102,13 @@ func (r *Runner) observe(h string) {
 
 func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res detect.Result, still, retried bool) {
 	t0 := time.Now() // per-file wall time -> journal Seconds column (how long this file took)
+	// The settings stamp must be the one the idempotency check will recompute,
+	// and that check uses the kind DETECTED from the bytes (process compares
+	// rec.Stamp with stampFor(res.Kind)). A "hat" collapse rewrites res.Kind
+	// below, so a refused collapse stamped with the rewritten kind could never
+	// match again and the file was re-encoded on EVERY run (battle:
+	// azart_zay\azart_zay-20230407-0001.mp4 in every journal section).
+	origKind := res.Kind
 	if still {
 		// The file collapses video -> photo: everything downstream (target
 		// extension, DB kind/format, achieved string, journal) follows the
@@ -1009,26 +1118,24 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 		res.Format = detect.FmtAVIF
 	}
 	finalPath := r.finalPath(path, res) // honest extension target
-	// Never let a rename swallow a DIFFERENT file. Two sources can want one
-	// honest name ("a.jpg" + "a.webp" copies, "a.jpg" + "A.PNG" on a
-	// case-insensitive filesystem): before this guard the later swap
-	// overwrote the other file's output and removed its source (89 files
-	// consumed in the FData archive). Refused BEFORE encoding, so both
-	// originals stay exactly as they are; nothing is written to the journal
-	// either, so if the rival disappears later this file compresses fine.
-	if releaseTarget, ok := r.claimTarget(path, finalPath); !ok {
-		r.skipNotSmaller.Add(1)
-		var sz int64
-		if fi, serr := os.Stat(path); serr == nil {
-			sz = fi.Size()
-		}
-		r.addSize(path, path)
-		r.logf("name collision %s: %s is taken by another file, both originals kept", rel, r.rel(finalPath))
-		r.changes.record("name collision", rel, r.rel(finalPath), sz, sz, time.Since(t0).Seconds(), res.Kind.String(), mediaFormatFor(res, finalPath), "", "honest name taken by another file: nothing touched")
+	// Reserve a name BEFORE encoding: one name must never be wanted by two
+	// different files. If the honest one is already owned by someone else this
+	// file gets a numbered name ("x (2).avif") instead of overwriting it, so
+	// both sources survive and both still get compressed.
+	chosen, releaseTarget := r.claimTarget(path, finalPath)
+	if chosen == "" {
+		releaseTarget()
+		r.errored.Add(1)
+		r.logf("name %s: no free honest name available near %s, file left untouched", rel, r.rel(finalPath))
 		return
-	} else {
-		defer releaseTarget()
 	}
+	defer releaseTarget()
+	nameTakenNote := ""
+	if !samePath(chosen, finalPath) {
+		nameTakenNote = "name taken: " + filepath.Base(finalPath) + " owned by another file; "
+		r.logf("name taken %s: %s is owned by another file, writing %s", rel, r.rel(finalPath), r.rel(chosen))
+	}
+	finalPath = chosen
 	// NTFS creation time must be captured BEFORE the swap: when finalPath ==
 	// path (same-name replace, e.g. mp4->mp4) the original is gone by the
 	// time we would otherwise read it back (the swap left the temp's birth).
@@ -1115,7 +1222,7 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 			r.skipNotSmaller.Add(1) // new "could not shrink" verdict of this run
 		}
 		r.addSize(path, path)
-		_ = r.store.MarkNoChange(ctx, srcHash, rel, res.Kind.String(), r.stampFor(res.Kind))
+		_ = r.store.MarkNoChange(ctx, srcHash, rel, origKind.String(), r.stampFor(origKind))
 		r.changes.record("not smaller", rel, rel, origSize, origSize, time.Since(t0).Seconds(), res.Kind.String(), mediaFormatFor(res, finalPath), "", hatNote(encNote, still))
 		p := r.ensureHonestExt(ctx, path, res)
 		if oi, serr := os.Stat(p); serr == nil {
@@ -1176,7 +1283,7 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 			r.skipNotSmaller.Add(1) // new "could not shrink" verdict of this run
 		}
 		r.addSize(path, path)
-		_ = r.store.MarkNoChange(ctx, srcHash, rel, res.Kind.String(), r.stampFor(res.Kind))
+		_ = r.store.MarkNoChange(ctx, srcHash, rel, origKind.String(), r.stampFor(origKind))
 		r.changes.record("not smaller", rel, rel, origInfo.Size(), newInfo.Size(), time.Since(t0).Seconds(), res.Kind.String(), mediaFormatFor(res, finalPath), "", hatNote(encNote, still))
 		p := r.ensureHonestExt(ctx, path, res)
 		if oi, serr := os.Stat(p); serr == nil {
@@ -1218,8 +1325,10 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 		r.logf("birthtime %s: %v", newRel, err)
 	}
 	// The new content is stable now: cache its triple so the next run skips the
-	// read. The rename carries an old key when the extension changed.
-	if path != finalPath {
+	// read. The rename carries an old key when the extension changed. On
+	// Windows a case-only extension change ("clip.MP4" -> "clip.mp4") is the
+	// SAME file, not a rename.
+	if !samePath(path, finalPath) {
 		if err := r.store.RenamePath(ctx, path, finalPath); err != nil {
 			r.logf("seen rename %s: %v", newRel, err)
 		}
@@ -1250,8 +1359,8 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 	if still {
 		action = "still collapsed" // was a video hat: one frame kept, soundtrack dropped
 	}
-	r.changes.record(action, rel, newRel, srcSize, dstSize, time.Since(t0).Seconds(), res.Kind.String(), mediaFormatFor(res, finalPath), achieved, encNote)
-	if finalPath != path {
+	r.changes.record(action, rel, newRel, srcSize, dstSize, time.Since(t0).Seconds(), res.Kind.String(), mediaFormatFor(res, finalPath), achieved, nameTakenNote+hatNote(encNote, still))
+	if !samePath(finalPath, path) {
 		safefs.RemoveIfExists(path)
 	}
 }
@@ -1261,11 +1370,12 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 // viewers must never be handed a file whose bytes contradict its name).
 // Doubled/chained media extensions ("VID_x.mp4.mp4", "clip.mp4.mov" — noise
 // left by earlier tools' renames) are cleaned up the same way.
-// On a name collision the file is left untouched with a warning. DB
-// decisions are hash-based, so no stored-filename rewrite is required.
-// Call AFTER addSize (a rename would make the old path unstatable). Returns
-// the current path: the same one when nothing was renamed, the honest one
-// otherwise (the caller uses it to keep the seen cache in sync).
+// If the honest name is owned by a DIFFERENT file, this file takes a numbered
+// honest name ("x (2).webp") — honesty is fixed either way and no file is
+// swallowed. DB decisions are hash-based, so no stored-filename rewrite is
+// required. Call AFTER addSize (a rename would make the old path unstatable).
+// Returns the current path: the same one when nothing was renamed, the honest
+// one otherwise (the caller uses it to keep the seen cache in sync).
 func (r *Runner) ensureHonestExt(ctx context.Context, path string, res detect.Result) string {
 	if !res.ExtensionLies && !doubledMediaExt(path) {
 		return path
@@ -1282,14 +1392,17 @@ func (r *Runner) ensureHonestExt(ctx context.Context, path string, res detect.Re
 		r.printBreak(func() { fmt.Printf("[dry-run] fix-ext: %s -> %s\n", r.rel(path), r.rel(newPath)) })
 		return path
 	}
-	// The same collision guard as the swap: a rename must never swallow a
-	// different file that already owns the honest name.
-	if release, ok := r.claimTarget(path, newPath); !ok {
-		r.logf("fix-ext %s: target %s already exists, keeping name", r.rel(path), r.rel(newPath))
+	// Reserve the honest name first. If another file owns it, this rename gets a
+	// numbered honest name ("x (2).webp") instead of swallowing that file: the
+	// lying extension is still fixed (canon: honesty always), nothing is lost.
+	chosen, release := r.claimTarget(path, newPath)
+	if chosen == "" {
+		release()
+		r.logf("fix-ext %s: no free honest name available near %s, keeping name", r.rel(path), r.rel(newPath))
 		return path
-	} else {
-		defer release()
 	}
+	defer release()
+	newPath = chosen
 	var sz int64
 	if fi, err := os.Stat(path); err == nil {
 		sz = fi.Size()
@@ -1322,14 +1435,17 @@ func (r *Runner) fixExtOnly(ctx context.Context, path string, res detect.Result)
 		r.printBreak(func() { fmt.Printf("[dry-run] fix-ext: %s -> %s\n", r.rel(path), r.rel(newPath)) })
 		return
 	}
-	// Collision guard: --fix-ext must never rename one file on top of another
-	// that already owns the honest name (the same swallow the swap guard fixes).
-	if release, ok := r.claimTarget(path, newPath); !ok {
-		r.logf("fix-ext %s: target %s already exists, keeping name", r.rel(path), r.rel(newPath))
+	// Reserve the honest name first: --fix-ext must never rename one file on top
+	// of another that already owns it. A numbered honest name is used instead, so
+	// the lie is still fixed and both files survive.
+	chosen, release := r.claimTarget(path, newPath)
+	if chosen == "" {
+		release()
+		r.logf("fix-ext %s: no free honest name available near %s, keeping name", r.rel(path), r.rel(newPath))
 		return
-	} else {
-		defer release()
 	}
+	defer release()
+	newPath = chosen
 	if err := os.Rename(path, newPath); err != nil {
 		r.errored.Add(1)
 		r.logf("fix-ext %s: %v", r.rel(path), err)

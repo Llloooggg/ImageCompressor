@@ -244,6 +244,18 @@ func formatFromType(t types.Type) Format {
 	}
 }
 
+// isoFamilyExts are the interchangeable suffixes of one container family: the
+// ISO Base Media File Format. QuickTime-brand bytes under a .mp4 name (or
+// isom-brand bytes under .mov) are NOT a lie — the container is the same
+// family, every viewer opens both, and every video we write is a real .mp4.
+//
+// Without this rule the two naming paths contradicted each other on such
+// files: ensureHonestExt renamed them to .mov (format's honest suffix) while
+// the encoder target was .mp4, so the same binary ping-ponged the name back
+// and forth on every run (six files in the live archive's other\ folder,
+// logged on 11-05 and again on 11-06).
+var isoFamilyExts = map[string]bool{".mp4": true, ".mov": true, ".m4v": true}
+
 // extensionLies compares on-disk suffix with the honest extension for the real
 // format. Missing suffix isn't a lie (we add one), only a wrong one is.
 func extensionLies(path string, format Format) bool {
@@ -255,8 +267,12 @@ func extensionLies(path string, format Format) bool {
 	if have == "" {
 		return false
 	}
-	// .jpeg and .jpg are both honest for jpeg; .m4v etc. treated as mp4-family.
-	if format == FmtJPEG && (have == ".jpeg") {
+	// .jpeg and .jpg are both honest for jpeg.
+	if format == FmtJPEG && have == ".jpeg" {
+		return false
+	}
+	// .mp4/.mov/.m4v are one honest family for ISO-BMFF video.
+	if (format == FmtMP4 || format == FmtMOV) && isoFamilyExts[have] {
 		return false
 	}
 	return have != want

@@ -93,3 +93,67 @@ func TestDetectAVI(t *testing.T) {
 		t.Fatalf("honest ext = %q", FmtAVI.HonestExt())
 	}
 }
+
+// isoFile builds a minimal 'ftyp' box with the given major brand and
+// compatible brands — enough for both filetype and our brand refiner.
+func isoFile(major string, brands ...string) []byte {
+	brands = append([]string{major}, brands...)
+	size := 24 + 4*len(brands)
+	out := make([]byte, size)
+	binary.BigEndian.PutUint32(out[0:4], uint32(size))
+	copy(out[4:8], "ftyp")
+	copy(out[8:12], major)
+	at := 16
+	for _, b := range brands {
+		copy(out[at:at+4], b)
+		at += 4
+	}
+	return out
+}
+
+// .mp4/.mov/.m4v are ONE honest family for ISO-BMFF video. Naming a
+// QuickTime-brand clip .mp4 is not a lie: the live archive ping-ponged six
+// files between .mp4 and .mov on every run because the honest-extension fixer
+// said .mov while the encoder target said .mp4.
+func TestISOFamilySuffixesAreAllHonest(t *testing.T) {
+	qt := isoFile("qt  ", "qt  ", "mp42", "isom")
+	for _, name := range []string{"clip.mov", "clip.mp4", "clip.m4v", "clip.MOV"} {
+		p := writeFile(t, name, qt)
+		res, err := Detect(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.Kind != KindVideo {
+			t.Fatalf("%s: kind = %s, want video", name, res.Kind)
+		}
+		if res.ExtensionLies {
+			t.Fatalf("%s: iso-family suffix must not count as a lie (format=%s)", name, res.Format)
+		}
+	}
+
+	// Same family the other way round: isom bytes under a .mov name.
+	p := writeFile(t, "clip.mov", isoFile("isom", "isom", "iso2", "mp41"))
+	res, err := Detect(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Format != FmtMP4 {
+		t.Fatalf("brand refiner: got %s, want mp4", res.Format)
+	}
+	if res.ExtensionLies {
+		t.Fatal("isom bytes under .mov are still iso-family: honest")
+	}
+
+	// The family rule must not smear across OTHER containers: an AVI or MKV
+	// name on iso bytes is still a lie and still gets fixed.
+	for _, name := range []string{"clip.avi", "clip.mkv", "clip.webm", "clip.jpg"} {
+		p := writeFile(t, name, qt)
+		res, err := Detect(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !res.ExtensionLies {
+			t.Fatalf("%s: %s on iso bytes must still be reported as a lie", name, res.Format)
+		}
+	}
+}
