@@ -5,8 +5,10 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -638,31 +640,123 @@ func TestClaimTarget_DeepChainThenCeiling(t *testing.T) {
 	}
 }
 
-// stemTwins is the name-jam map gather builds. It answers "does another file
-// want this output name" — by NAME only, never by type (canon: classification
-// stays magic-bytes-only, like videosLast queueing by suffix).
-func TestStemTwinsDetectNameJams(t *testing.T) {
+// shotPath is the naming half of the "hat" rule (user): EVERY collapsed
+// frame carries the "_shot" postfix, no collision-testing needed — an
+// original can never own an "_shot" name next to its picture (the filesystem
+// forbids two files with one name), so the honest stem always stays with the
+// real photo. Names with interior dots must survive untouched: the postfix
+// rides at the end of the stem.
+func TestShotPathAlwaysPostfixes(t *testing.T) {
+	cases := map[string]string{
+		filepath.Join("people", "x.avif"):                      filepath.Join("people", "x_shot.avif"),
+		filepath.Join("a", "___alaska.___-20250606-0001.avif"): filepath.Join("a", "___alaska.___-20250606-0001_shot.avif"),
+		filepath.Join("b", "holiday.photo (2024).avif"):        filepath.Join("b", "holiday.photo (2024)_shot.avif"),
+	}
+	for in, want := range cases {
+		if got := shotPath(in); got != want {
+			t.Errorf("shotPath(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// The one real name fight left after the "_shot" rule: two hats sharing one
+// stem ("x.mp4" + "x.mov") whose frames both want "x_shot.avif". claimTarget
+// numbers the second frame ("x_shot (2).avif") instead of overwriting the
+// first — the same guard photos get, just on the shot name.
+func TestClaimTarget_ShotFrameFightGetsNumbered(t *testing.T) {
 	r, _ := newTestRunner(t)
 	root := r.processRoot
-	for _, name := range []string{
-		`people\x.jpg`, `people\x.mp4`, // photo + its "hat" clip: the deadly pair
-		`people\y.avif`, `people\y.mp4`,
-		`people\chain.mp4.mov`, `people\chain.jpg`,
-		`docs\note.txt`, `docs\note.mp4`, // a text sibling is not a rival
-	} {
-		r.countStem(filepath.Join(root, filepath.FromSlash(name)), root)
+	shot := filepath.Join(root, "x_shot.avif")
+	if err := os.WriteFile(shot, []byte("first frame"), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	yes := []string{`people\x.jpg`, `people\x.mp4`, `people\y.avif`, `people\chain.mp4.mov`, `people\chain.jpg`}
-	for _, name := range yes {
-		if !r.hasStemTwin(filepath.Join(root, filepath.FromSlash(name))) {
-			t.Errorf("%s: expected a same-name twin", name)
+	chosen, release := r.claimTarget(filepath.Join(root, "x.mov"), shot)
+	defer release()
+	if got := filepath.Base(chosen); got != "x_shot (2).avif" {
+		t.Fatalf("a second hat frame must get a numbered shot name, got %s", got)
+	}
+	if data, err := os.ReadFile(shot); err != nil || string(data) != "first frame" {
+		t.Fatalf("the first frame must never be touched: %q %v", data, err)
+	}
+}
+
+// End to end: a real photo "x.jpg" and a same-named "hat" clip coexist safely.
+// The photo takes the honest "x.avif", the frame takes "x_shot.avif", nobody
+// overwrites anybody — regardless of which file is processed first. (The old
+// stemTwins gate blocked the collapse itself on a same-named sibling; that
+// assumption died with a PSNR census of the live archive: 175 of 177 such
+// pairs are DIFFERENT pictures.)
+func TestProcess_HatNextToPhoto_ShotNameKeepsBoth(t *testing.T) {
+	ctx := context.Background()
+	loc := tools.NewLocator()
+	if loc.FFmpeg() == "" {
+		t.Skip("no ffmpeg (embedded or PATH), hat collapse test skipped")
+	}
+	// newTestRunner's config leaves Still=false; this test needs the collapse
+	// switch on (production default is on, flags layer sets it).
+	dir := t.TempDir()
+	st, err := store.Open(context.Background(), filepath.Join(dir, "image_compressor.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	r := New(&config.Config{Input: dir, Yes: true, Still: true}, st, loc)
+	r.processRoot = dir
+	root := dir
+
+	// Hat clip: one static gray frame + glued soundtrack, built the way
+	// social apps do it (same fixture shape as media/still_test).
+	hp := filepath.Join(root, "x.mp4")
+	if b, err := exec.Command(loc.FFmpeg(), "-y", "-hide_banner", "-loglevel", "error",
+		"-f", "lavfi", "-i", "color=c=0x7f807f:s=320x240:d=4:r=30",
+		"-f", "lavfi", "-i", "sine=frequency=220:duration=4",
+		"-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", "-g", "120",
+		"-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", hp).CombinedOutput(); err != nil {
+		t.Fatalf("build hat clip: %v\n%s", err, b)
+	}
+	// A REAL photo with the same stem: a different picture (red frame).
+	jp := filepath.Join(root, "x.jpg")
+	if b, err := exec.Command(loc.FFmpeg(), "-y", "-hide_banner", "-loglevel", "error",
+		"-f", "lavfi", "-i", "color=c=red:s=320x240:r=30", "-frames:v", "1", jp).CombinedOutput(); err != nil {
+		t.Fatalf("build photo: %v\n%s", err, b)
+	}
+
+	r.process(ctx, hp) // hat first: the deadly order of the 05.11 run
+	r.process(ctx, jp)
+
+	if _, err := os.Stat(filepath.Join(root, "x_shot.avif")); err != nil {
+		t.Fatalf("frame output x_shot.avif missing: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "x.avif")); err != nil {
+		t.Fatalf("photo output x.avif missing: %v", err)
+	}
+	for _, gone := range []string{hp, jp} {
+		if _, err := os.Stat(gone); !os.IsNotExist(err) {
+			t.Fatalf("source %s must be replaced by its output", filepath.Base(gone))
 		}
 	}
-	no := []string{`docs\note.mp4`, `people\solo.jpg`}
-	for _, name := range no {
-		if r.hasStemTwin(filepath.Join(root, filepath.FromSlash(name))) {
-			t.Errorf("%s: expected no twin", name)
+	// No numbered junk beside them: the shot name left no fight for claimTarget.
+	if es, err := os.ReadDir(root); err == nil {
+		for _, e := range es {
+			if strings.Contains(e.Name(), " (") {
+				t.Fatalf("unexpected numbered file: %s", e.Name())
+			}
 		}
+	}
+	if r.errored.Load() != 0 {
+		t.Fatalf("errored = %d, want 0", r.errored.Load())
+	}
+
+	// Second pass: both outputs are processed — idempotent, nothing moves.
+	r.process(ctx, filepath.Join(root, "x_shot.avif"))
+	r.process(ctx, filepath.Join(root, "x.avif"))
+	for _, keep := range []string{"x_shot.avif", "x.avif"} {
+		if _, err := os.Stat(filepath.Join(root, keep)); err != nil {
+			t.Fatalf("second pass must leave %s alone: %v", keep, err)
+		}
+	}
+	if r.errored.Load() != 0 {
+		t.Fatalf("errored after second pass = %d, want 0", r.errored.Load())
 	}
 }
 

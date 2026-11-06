@@ -64,11 +64,6 @@ type Runner struct {
 	claimMu sync.Mutex
 	claims  map[string]bool
 
-	// stemTwins counts how many media files the walk found under one honest
-	// name stem in the same folder. Count >= 2 means two files want one output
-	// name. Filled by gather, read-only while workers run.
-	stemTwins map[string]int
-
 	multi     bool        // VT fixed-height status block: counters + per-worker rows
 	firstDraw atomic.Bool // first VT repaint of this run
 	statusVis bool        // live block is currently on screen (guarded by statusMu)
@@ -128,59 +123,20 @@ func New(cfg *config.Config, st *store.Store, loc *tools.Locator) *Runner {
 		hasFFmpeg:  loc.FFmpeg() != "",
 		observed:   map[string]struct{}{},
 		claims:     map[string]bool{},
-		stemTwins:  map[string]int{},
 	}
 }
 
-// stemKey is the identity our naming rules give a file: its folder plus its
-// name with the trailing (and chained) media extensions removed, case-folded
-// where the filesystem folds case. Every file sharing a key gets the same
-// finalPath ("x.jpg" and "x.mp4" both want "x.avif"), so a count above one
-// means a name fight.
-//
-// This reads SUFFIXES on purpose: output names are a suffix game. It never
-// decides what a file IS — classification and honesty stay magic-bytes-only
-// (canon), exactly like videosLast which only queues by extension.
-func stemKey(path string) string {
-	stem := filepath.Base(path)
-	for {
-		e := filepath.Ext(stem)
-		if e == "" || !detect.IsMediaExt(e) {
-			break
-		}
-		t := stem[:len(stem)-len(e)]
-		if t == "" {
-			break
-		}
-		stem = t
-	}
-	key := stem
-	if runtime.GOOS == "windows" {
-		key = strings.ToLower(key)
-	}
-	return filepath.Join(filepath.Dir(path), key)
-}
-
-// countStem records one walked file under its name stem, keyed RELATIVE to the
-// walked root so the same file seen through the --output mirror lands on the
-// same key (the mirror keeps the relative layout). Only media-suffixed files
-// are counted: they are the ones that can claim an output name (a same-named
-// "x.txt" is not a rival). Gather time only.
-func (r *Runner) countStem(path, walkRoot string) {
-	if !detect.IsMediaExt(filepath.Ext(path)) {
-		return
-	}
-	rel, err := filepath.Rel(walkRoot, path)
-	if err != nil {
-		rel = filepath.Base(path)
-	}
-	r.stemTwins[stemKey(rel)]++
-}
-
-// hasStemTwin reports whether another walked file in the same folder wants the
-// same honest output name as this one (same stem under processRoot).
-func (r *Runner) hasStemTwin(path string) bool {
-	return r.stemTwins[stemKey(r.rel(path))] >= 2
+// shotPath renames a "hat" collapse target: "x.avif" -> "x_shot.avif". The
+// postfix goes on EVERY collapsed frame, unconditionally (the user's rule):
+// the frame is a derived file, not an original, and an original can never own
+// an "_shot" name in a folder where its real picture lives — the filesystem
+// forbids two files with one name. So the honest stem always stays with the
+// real picture and no collision-testing is needed. The only real name fight
+// left is frame against frame ("x.mp4" + "x.mov", both hats): claimTarget
+// numbers those ("x_shot (2).avif") like any other contested name.
+func shotPath(target string) string {
+	ext := filepath.Ext(target)
+	return target[:len(target)-len(ext)] + "_shot" + ext
 }
 
 // samePath compares paths the way the filesystem does them. On Windows
@@ -209,8 +165,8 @@ const maxNameAttempts = 1000
 //
 // The requested honest name is preferred. When that name is already owned by a
 // DIFFERENT file — two sources with one stem ("a.jpg" + "a.webp" copies,
-// "a.jpg" + "A.PNG" on a case-insensitive filesystem, or a "hat" clip whose
-// extracted frame wants the photo's name) — the rival's name is NOT taken
+// "a.jpg" + "A.PNG" on a case-insensitive filesystem, or two "hat" clips whose
+// frames both want "a_shot.avif") — the rival's name is NOT taken
 // over: a numbered name is reserved instead ("a (2).avif"). The reservation
 // happens BEFORE encoding because safefs.AtomicReplace overwrites
 // unconditionally: the FData archive lost 274 files (160 of them photos
@@ -882,7 +838,6 @@ func (r *Runner) gather(ctx context.Context) ([]string, error) {
 		if fi, ierr := d.Info(); ierr == nil {
 			r.scanBytes.Add(fi.Size()) // feeds the byte-based ETA in the live status
 		}
-		r.countStem(p, src) // name-jam map: who else wants this output name
 		out = append(out, p)
 		return nil
 	})
@@ -1056,15 +1011,14 @@ func (r *Runner) process(ctx context.Context, path string) {
 	// StillVideo). Runs after idempotency checks so processed/skipped files
 	// never pay for probing; both witnesses must agree before we collapse.
 	//
-	// A same-stem sibling blocks the collapse: if the folder already holds
-	// "x.jpg" (or "x.png"/"x.webp") next to "x.mp4", that photo IS the picture
-	// the clip would contribute, and the frame would want the photo's own
-	// honest name. Collapsing there duplicated the picture and — before names
-	// were claimed — overwrote the compressed photo: 160 of the 274 files the
-	// live archive lost died exactly this way. Such clips now run the normal
-	// video ladder (or stay as they are if AV1 cannot beat them).
+	// A same-stem sibling does NOT block the collapse (the old gate assumed
+	// "same name means same picture" — a PSNR census of the live archive
+	// disproved that: 175 of 177 such pairs are different pictures). The
+	// frame keeps a name of its own: encodeSwap appends "_shot" ("x.mp4" ->
+	// "x_shot.avif"), so the folder's real "x.jpg" always gets the honest
+	// "x.avif" and nobody is ever overwritten.
 	still := false
-	if res.Kind == detect.KindVideo && r.cfg.Still && r.hasFFmpeg && !r.hasStemTwin(path) {
+	if res.Kind == detect.KindVideo && r.cfg.Still && r.hasFFmpeg {
 		// The pixel verification decodes the whole file: minutes on a long
 		// video, so the slot must say what is happening.
 		r.trackStage(rel, "still?")
@@ -1081,14 +1035,14 @@ func (r *Runner) process(ctx context.Context, path string) {
 	if r.cfg.DryRun {
 		target := r.finalPath(path, res)
 		if still {
-			target = replaceExt(target, detect.FmtAVIF.HonestExt())
+			target = shotPath(replaceExt(target, detect.FmtAVIF.HonestExt()))
 		}
 		note := ""
 		if still {
 			note = ", collapse still-image video to photo"
 		}
 		if !samePath(target, path) && fileExists(target) {
-			note += ", honest name owned by another file -> numbered name instead"
+			note += ", name owned by another file -> numbered name instead"
 		}
 		r.printBreak(func() { fmt.Printf("[dry-run] %s -> %s%s\n", rel, filepath.Base(target), note) })
 		return
@@ -1122,6 +1076,12 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 		res.Format = detect.FmtAVIF
 	}
 	finalPath := r.finalPath(path, res) // honest extension target
+	if still {
+		// The frame is a derived file, never an original: it takes its own
+		// "_shot" name instead of ever contesting the honest one (user rule),
+		// so a same-named photo keeps "x.avif" untouched.
+		finalPath = shotPath(finalPath)
+	}
 	// Reserve a name BEFORE encoding: one name must never be wanted by two
 	// different files. If the honest one is already owned by someone else this
 	// file gets a numbered name ("x (2).avif") instead of overwriting it, so
