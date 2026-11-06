@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -137,5 +138,40 @@ func TestNameTakenNoticeStaysOutOfTheErrorJournal(t *testing.T) {
 	}
 	if !strings.Contains(journal, "\terror\t") || !strings.Contains(journal, "no free honest name") {
 		t.Fatalf("a real refusal must still be journaled as an error:\n%s", journal)
+	}
+}
+
+// The live status block is fixed height and positional: informational notices
+// are MUTED while it is up (the journal row + its Comment carry the fact). In
+// single-line / pipe mode there is no block to protect, so the notice prints.
+func TestNameTakenNoticeIsMutedInTheLiveBlock(t *testing.T) {
+	r, _ := newTestRunner(t)
+	capture := func(run func()) string {
+		old := os.Stdout
+		rd, wr, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		os.Stdout = wr
+		done := make(chan string, 1)
+		go func() {
+			b, _ := io.ReadAll(rd)
+			done <- string(b)
+		}()
+		run()
+		_ = wr.Close()
+		os.Stdout = old
+		out := <-done
+		_ = rd.Close()
+		return out
+	}
+
+	r.multi = true
+	if got := capture(func() { r.noticef("name taken %s: %s is owned by another file", "dup.webp", "dup.avif") }); got != "" {
+		t.Fatalf("live-block mode must not print notices at all, got %q", got)
+	}
+	r.multi = false
+	if got := capture(func() { r.noticef("name taken %s: writing %s", "dup.webp", "dup (2).avif") }); !strings.Contains(got, "name taken") {
+		t.Fatalf("single-line mode must still print the notice, got %q", got)
 	}
 }

@@ -1661,11 +1661,18 @@ func (r *Runner) logf(format string, v ...any) {
 
 // r.noticef emits an INFORMATIONAL line (a numbered name was taken, etc.):
 // console only, never the journal. Only real anomalies belong in the journal's
-// error column — a swap that succeeded under a numbered name already has its
+// error column - a swap that succeeded under a numbered name already has its
 // own row ("compressed" with the "name taken:" Comment prefix), so mirroring
-// the notice would fill the log with fake errors (~100 of them over the live
-// archive). printBreak keeps the live block intact in VT mode.
+// the notice would fill the log with fake errors (~93 of them over the live
+// archive). In the VT live-block mode the notice is MUTED, exactly like errors:
+// the journal row and its Comment carry it, and 93 break lines would drum the
+// fixed block up and down for no information the header cannot miss. In
+// single-line/pipe mode (and --dry-run) there is no block to protect, so the
+// line still prints.
 func (r *Runner) noticef(format string, v ...any) {
+	if r.multi {
+		return
+	}
 	r.printBreak(func() { fmt.Printf(format+"\n", v...) })
 }
 
