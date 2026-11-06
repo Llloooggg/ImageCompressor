@@ -197,9 +197,13 @@ func samePath(a, b string) bool {
 	return false
 }
 
-// maxNameAttempts bounds the numbered-name search. Reaching it means the
-// folder holds 64 same-stem media files: we stop rather than rename forever.
-const maxNameAttempts = 64
+// maxNameAttempts bounds the numbered-name search. Every attempt is one stat,
+// and the loop stops at the first free name, so the bound is a runaway guard,
+// not a practical limit: the live archive's longest name fight is TWO files,
+// which asks for one numbered name. Reaching this ceiling means a folder holds
+// that many same-stem media files; we stop and leave the file untouched rather
+// than rename forever or overwrite anyone.
+const maxNameAttempts = 1000
 
 // claimTarget reserves a writable honest name for one swap and returns it.
 //

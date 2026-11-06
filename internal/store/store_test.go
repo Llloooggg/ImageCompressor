@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -268,5 +269,59 @@ func TestSeenCache(t *testing.T) {
 	}
 	if _, ok, _ := s.SeenHash(ctx, `family\live.avif`, 1, 2); !ok {
 		t.Fatal("cache row for live content must survive")
+	}
+}
+
+// A finished run leaves ONE self-contained database file: the WAL is folded
+// into it and the -wal/-shm sidecars are gone - and they may only disappear
+// AFTER the connection is closed (deleting them while the DB is open is what
+// corrupts a WAL database). Whatever was committed must survive the fold.
+func TestCloseClean_FoldsWALAndRemovesSidecars(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "clean.db")
+	s, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkCompressed(ctx, "h-fold", "photo.jpg", "image", "avifenc s6 q=85"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RememberPath(ctx, `family\photo.jpg`, 100, 200, "h-fold"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dbPath + "-wal"); err != nil {
+		t.Fatalf("WAL mode must keep a -wal while the DB is open: %v", err)
+	}
+	// A checkpoint folds the log into the main file without closing anything.
+	if err := s.Checkpoint(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Stat(dbPath + "-wal"); err == nil && fi.Size() != 0 {
+		t.Fatalf("checkpoint must truncate the WAL, it is %d B", fi.Size())
+	}
+	if err := s.CloseClean(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, side := range []string{"-wal", "-shm"} {
+		if _, err := os.Stat(dbPath + side); !os.IsNotExist(err) {
+			t.Fatalf("%s must be gone after CloseClean (err=%v)", side, err)
+		}
+	}
+
+	// reopened: everything committed is still there, and the file is healthy
+	s2, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	if _, ok, err := s2.IsProcessed(ctx, "h-fold"); err != nil || !ok {
+		t.Fatalf("committed row must survive the fold: ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := s2.SeenHash(ctx, `family\photo.jpg`, 100, 200); err != nil || !ok {
+		t.Fatalf("cache row must survive the fold: ok=%v err=%v", ok, err)
+	}
+	var verdict string
+	if err := s2.db.QueryRow(`PRAGMA integrity_check`).Scan(&verdict); err != nil || verdict != "ok" {
+		t.Fatalf("integrity after fold: %q (err=%v)", verdict, err)
 	}
 }

@@ -27,6 +27,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Llloooggg/ImageCompressor/internal/safefs"
 	_ "modernc.org/sqlite"
 )
 
@@ -59,8 +60,9 @@ type StagedRow struct {
 
 // Store serializes all DB access (single-writer).
 type Store struct {
-	db *sql.DB
-	mu sync.Mutex
+	db   *sql.DB
+	path string // DB file path, so the WAL sidecar names are known for cleanup
+	mu   sync.Mutex
 }
 
 // Open opens (or creates) the DB, adopts a legacy schema if present, and enables
@@ -82,7 +84,7 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	s := &Store{db: db}
+	s := &Store{db: db, path: path}
 	if err := s.migrate(ctx); err != nil {
 		db.Close()
 		return nil, err
@@ -91,6 +93,45 @@ func Open(ctx context.Context, path string) (*Store, error) {
 }
 
 func (s *Store) Close() error { return s.db.Close() }
+
+// Checkpoint folds everything committed in the WAL into the main DB file and
+// truncates the WAL to zero. The connection pool is capped at one connection
+// (see Open), so this cannot be BUSY against ourselves.
+func (s *Store) Checkpoint(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var busy, logFrames, checkpointed int
+	if err := s.db.QueryRowContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`).
+		Scan(&busy, &logFrames, &checkpointed); err != nil {
+		return fmt.Errorf("wal_checkpoint: %w", err)
+	}
+	if busy != 0 {
+		return fmt.Errorf("wal_checkpoint: blocked with %d frames still in the log", logFrames)
+	}
+	return nil
+}
+
+// CloseClean ends the run's work with the DB: fold the WAL into the main file,
+// close the connection, THEN remove the sidecars. The order is the whole
+// point - deleting -wal/-shm while the database is open is exactly what
+// corrupts a WAL database, so they are only ever dropped after Close.
+//
+// A run that finishes this way leaves one self-contained .db (the sidecars
+// come back on the next open), so copying that single file is a valid backup
+// at all times. After a hard kill the sidecars stay on purpose: a non-empty
+// -wal holds committed journal rows, and SQLite replays them on the next open.
+func (s *Store) CloseClean(ctx context.Context) error {
+	if err := s.Checkpoint(ctx); err != nil {
+		// not fatal: the WAL is still replayed on the next open, nothing is lost
+		fmt.Fprintf(os.Stderr, "Warning: WAL checkpoint skipped: %v\n", err)
+	}
+	if err := s.db.Close(); err != nil {
+		return err
+	}
+	safefs.RemoveIfExists(s.path + "-wal")
+	safefs.RemoveIfExists(s.path + "-shm")
+	return nil
+}
 
 func (s *Store) migrate(ctx context.Context) error {
 	stmts := []string{

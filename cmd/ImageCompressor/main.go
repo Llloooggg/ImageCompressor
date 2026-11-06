@@ -65,7 +65,11 @@ func runMain(ctx context.Context, cfg *config.Config) error {
 	if err != nil {
 		return fmt.Errorf("open DB: %w", err)
 	}
-	defer st.Close()
+	// End of run: fold the WAL into the DB file, close, then drop the sidecars
+	// (never while open). The checkpoint must survive a Ctrl+C stop, hence
+	// WithoutCancel. On a hard kill the defers do not run at all, and that is
+	// correct: SQLite replays the WAL on the next open.
+	defer func() { _ = st.CloseClean(context.WithoutCancel(ctx)) }()
 
 	fmt.Printf("Input:  %s\n", cfg.Input)
 	if !cfg.InPlace() {

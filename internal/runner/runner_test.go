@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -591,6 +592,49 @@ func TestClaimTarget_NumberedNameInsteadOfOverwrite(t *testing.T) {
 		if !samePath(chosen2, upperSrc) {
 			t.Fatalf("case-only same-file target must stay itself, got %s", chosen2)
 		}
+	}
+}
+
+// The ceiling on the numbered-name search is a runaway guard, not a practical
+// limit (the archive's real name fights are TWO files deep), so a deep chain
+// must keep looking instead of giving up at an old small bound - and when the
+// ceiling really is reached, the file is left exactly as it is.
+func TestClaimTarget_DeepChainThenCeiling(t *testing.T) {
+	r, _ := newTestRunner(t)
+	root := r.processRoot
+
+	honest := filepath.Join(root, "x.avif")
+	if err := os.WriteFile(honest, []byte("first owner"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// occupy far more numbered names than the old ceiling of 64 allowed
+	for n := 2; n <= 90; n++ {
+		p := filepath.Join(root, fmt.Sprintf("x (%d).avif", n))
+		if err := os.WriteFile(p, []byte("taken"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	chosen, release := r.claimTarget(filepath.Join(root, "x.jpg"), honest)
+	if filepath.Base(chosen) != "x (91).avif" {
+		release()
+		t.Fatalf("a deep chain must keep counting, want x (91).avif, got %s", filepath.Base(chosen))
+	}
+	release()
+
+	// fill up to the ceiling: nothing is claimed, nothing is overwritten
+	for n := 91; n <= maxNameAttempts; n++ {
+		p := filepath.Join(root, fmt.Sprintf("x (%d).avif", n))
+		if err := os.WriteFile(p, []byte("taken"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deep, releaseDeep := r.claimTarget(filepath.Join(root, "x.webp"), honest)
+	releaseDeep()
+	if deep != "" {
+		t.Fatalf("at the ceiling no name may be claimed, got %s", filepath.Base(deep))
+	}
+	if data, err := os.ReadFile(honest); err != nil || string(data) != "first owner" {
+		t.Fatalf("the ceiling must never damage the owner's file: %q %v", data, err)
 	}
 }
 
