@@ -54,10 +54,7 @@ func (c *changeLog) record(action, src, dst string, srcSize, dstSize int64, secs
 	if c == nil {
 		return
 	}
-	saved := srcSize - dstSize
-	if saved < 0 {
-		saved = 0
-	}
+	saved := srcSize - dstSize // negative is allowed: a hat photo may grow (canon rule 4)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	fmt.Fprintf(c.w, "%s\t%s\t%s\t%s\t%.3f\t%.3f\t%.3f\t%.1f\t%s\t%s\t%s\t%s\n",

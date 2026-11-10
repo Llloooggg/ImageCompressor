@@ -659,6 +659,23 @@ func TestShotPathAlwaysPostfixes(t *testing.T) {
 	}
 }
 
+// The journal wording of a hat row must match what the run actually did. A hat
+// never lands in the "not smaller" branch (the collapse does not bargain with
+// size), so hatNote is a prefix only — inventing a decline sentence stamped 150
+// rows that had just saved up to 80% of their weight with "one kept frame NOT
+// SMALLER than the clip".
+func TestHatNoteWording(t *testing.T) {
+	if got := hatNote("", true); got != "" {
+		t.Errorf("hatNote on a single-step collapse = %q, want empty", got)
+	}
+	if got := hatNote("avifenc q85 kept 1.2s", true); got != "hat: avifenc q85 kept 1.2s" {
+		t.Errorf("hatNote with a trail = %q", got)
+	}
+	if got := hatNote("svt crf28 kept 40s", false); got != "svt crf28 kept 40s" {
+		t.Errorf("hatNote for a plain video = %q, want the trail untouched", got)
+	}
+}
+
 // The one real name fight left after the "_shot" rule: two hats sharing one
 // stem ("x.mp4" + "x.mov") whose frames both want "x_shot.avif". claimTarget
 // numbers the second frame ("x_shot (2).avif") instead of overwriting the

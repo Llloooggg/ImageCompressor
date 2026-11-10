@@ -10,20 +10,42 @@
 //
 //  1. Bitstream watchdog, pure Go, millisecond cost, covers the WHOLE
 //     timeline without decoding: parse the MP4/MOV sample table (stsz/stss)
-//     and look at the LARGEST inter-frame packet. A static picture encodes to
-//     packets of tens of bytes (nothing to transmit); a sticker or caption
-//     over a static background reaches maybe a kilobyte; real motion anywhere
-//     in the file produces tens of kilobytes. Orders of magnitude apart.
+//     and measure the SHARE of "expensive" inter-frame packets, not the
+//     single largest one. A static picture encodes to packets of tens of
+//     bytes (nothing to transmit); a sticker or caption over a static
+//     background reaches maybe a kilobyte; real motion anywhere in the file
+//     produces tens of kilobytes. Orders of magnitude apart. A per-packet
+//     maximum is the wrong statistic: social transcodes sprinkle in a handful
+//     of huge hidden reference frames (show_frame=0, periodic refresh) whose
+//     size has nothing to do with motion — one such packet used to veto a
+//     genuine hat. So the watchdog vetoes only when MORE THAN
+//     stillHeavyPercent of the inter packets reach stillMaxPacket, i.e. when
+//     expensive frames cover more than ~5% of the timeline.
 //
 //  2. Pixel verification of candidates only (the cheap filter already
 //     eliminated ~all real videos, so paying a full decode here is fine):
-//     scale every decoded frame to 128x128 gray and require every frame to
-//     match both its predecessor AND the first frame within a small MAD.
-//     Consecutive diffs catch transitions (slideshow), first-vs-current diffs
-//     catch slow drift (Ken Burns zoom) that consecutive diffs alone would
-//     hide. A tiny animated sticker dilutes under the threshold and is
-//     absorbed on purpose — the user decided sticker garnish is not content
-//     worth keeping.
+//     scale every decoded frame to 128x128 gray and measure the SHARE of
+//     pixels that change, not their mean. Two conditions, both must hold:
+//
+//     a. no single frame may change more than stillMaxChangeShare of the
+//     pixels, whether compared with its predecessor or with the first frame.
+//     The predecessor comparison catches transitions (slideshow), the
+//     first-frame comparison catches slow drift (Ken Burns zoom) that
+//     consecutive diffs alone hide. A mean-difference threshold is NOT
+//     enough: a 200x200 face moving in a 1080p frame changes <2% of the
+//     pixels yet averages out to a harmless MAD — and that is exactly how a
+//     real video used to slip through.
+//
+//     b. the change must also be RARE in time: at most stillMaxMovingPercent
+//     of the frames may carry a frame-to-frame change. A static picture is
+//     bit-identical on nearly every frame and only "twitches" when the
+//     encoder refreshes (the archive's hats: 0-16% of frames, all tiny
+//     periodic spikes); real motion touches 20-100% of frames. The archive
+//     gap between those two populations is empty, so 20% is safe.
+//
+//     A tiny animated sticker stays under both limits and is absorbed on
+//     purpose — the user decided sticker garnish is not content worth
+//     keeping.
 package media
 
 import (
@@ -42,14 +64,32 @@ import (
 )
 
 const (
-	// stillMaxPacket: an inter-frame sample at/above this size means real
-	// motion exists somewhere in the timeline (static floor is ~10^2-3*10^2 B,
-	// sticker/caption residuals ~10^3 B, real movement ~10^4 B).
+	// stillMaxPacket: an inter-frame sample at/above this size is "expensive"
+	// (static floor is ~10^2-3*10^2 B, sticker/caption residuals ~10^3 B,
+	// real movement ~10^4 B).
 	stillMaxPacket = 12 * 1024
-	// stillMaxMAD: mean per-pixel absolute difference (0..255) at 128x128 gray.
-	// Encoder noise on a still is <=3, small stickers/plates 1-5, zooms and
-	// real video >=15.
-	stillMaxMAD = 6
+	// stillHeavyPercent: share of expensive inter packets that still reads as
+	// a static picture. A hat carries ~2% (hidden refresh frames, one per
+	// 1-2 s); real video carries 17-52%. Veto above 5%: motion spanning a
+	// twentieth of the timeline or more is content, not a bitstream artifact.
+	stillHeavyPercent = 5
+	// stillPixelDelta: a pixel counts as changed when its gray value moved by
+	// more than this (0..255). Encoder noise on a still stays within 0-5.
+	stillPixelDelta = 10
+	// stillMaxChangeShare: largest share of pixels (percent, at 128x128) that
+	// may change in ANY single frame, versus both the predecessor and the
+	// first frame. A static picture re-encoded to AV1 keeps 99.9%+ of pixels
+	// intact even across refresh frames; real motion moves whole regions.
+	// The archive shows a clean gap: every accepted hat <=1%, the quietest
+	// real video >=2%.
+	stillMaxChangeShare = 1.0
+	// stillNoiseShare: below this share of changed pixels a frame counts as
+	// unchanged (a few pixels of refresh noise are not motion).
+	stillNoiseShare = 0.1
+	// stillMaxMovingPercent: share of frames allowed to carry a frame-to-frame
+	// change. Static pictures twitch only on periodic refresh (<=16% of frames
+	// in the archive); real motion touches 20-100%. 20% sits in the empty gap.
+	stillMaxMovingPercent = 20
 	// stillMinSamples: too few frames for either witness to mean anything —
 	// leave the file to the normal video path.
 	stillMinSamples = 20
@@ -65,7 +105,7 @@ func StillVideo(ctx context.Context, loc *tools.Locator, src string) bool {
 	if err != nil {
 		return false
 	}
-	if v.samples < stillMinSamples || v.maxInter >= stillMaxPacket {
+	if !v.stillBitstream() {
 		return false
 	}
 	ff := loc.FFmpeg()
@@ -77,12 +117,18 @@ func StillVideo(ctx context.Context, loc *tools.Locator, src string) bool {
 }
 
 // CollapseStill turns a StillVideo-confirmed file into one AVIF photo:
-// mid-duration frame -> PNG intermediate -> the regular photo encoder
-// (ladder/guard semantics included; the base level almost always wins since
-// it is compared against the VIDEO size). The soundtrack is deliberately
-// discarded. tmp must end in .avif; the original is never touched.
-// progress (optional) forwards the photo ladder labels to the live status.
+// mid-duration frame -> PNG intermediate -> the photo encoder at the base
+// quality level. The soundtrack is deliberately discarded. tmp must end in
+// .avif; the original is never touched.
+//
+// The collapse never bargains with size (user rule, canon rule 4): a hat is a
+// photo wearing a video costume, so the honest format and one frame in the
+// gallery are worth more than a few KB — o.PhotoAcceptLarger is forced here and
+// the ladder collapses to its base level (the AV1 video pass already squeezed
+// that frame efficiently, so a standalone AVIF frequently comes out bigger).
+// progress (optional) forwards the photo label to the live status.
 func CollapseStill(ctx context.Context, loc *tools.Locator, o Opts, src, tmp string, origSize int64, progress func(label string)) (PhotoResult, error) {
+	o.PhotoAcceptLarger = true
 	ff := loc.FFmpeg()
 	if ff == "" {
 		return PhotoResult{}, errors.New("no ffmpeg to extract a frame from video")
@@ -120,7 +166,8 @@ func CollapseStill(ctx context.Context, loc *tools.Locator, o Opts, src, tmp str
 // --- witness 2: pixel pass -------------------------------------------------
 
 // framesNearlyStill decodes the whole video (candidates only — cheap!) and
-// checks every frame against both its predecessor and the first frame.
+// applies witness 2: no single frame may change much of the picture, and
+// change must be rare in time (see the package comment).
 func framesNearlyStill(ctx context.Context, ff, src string) (bool, error) {
 	cmd := exec.CommandContext(ctx, ff, "-hide_banner", "-loglevel", "error",
 		"-i", src, "-vf", "scale=128:128:flags=area,format=gray", "-f", "rawvideo", "-")
@@ -135,7 +182,8 @@ func framesNearlyStill(ctx context.Context, ff, src string) (bool, error) {
 	}
 	const frameSize = 128 * 128
 	var first, prev, cur []byte
-	frames, worst := 0, 0
+	frames, moving := 0, 0
+	maxShare := 0.0
 	done := false
 	for !done {
 		if ctx.Err() != nil {
@@ -151,14 +199,19 @@ func framesNearlyStill(ctx context.Context, ff, src string) (bool, error) {
 		if frames == 1 {
 			first = cur
 		} else {
-			if m := mad8(cur, prev); m > worst {
-				worst = m
+			vsPrev := changedShare(cur, prev, stillPixelDelta)
+			vsFirst := changedShare(cur, first, stillPixelDelta)
+			if vsPrev > maxShare {
+				maxShare = vsPrev
 			}
-			if m := mad8(cur, first); m > worst {
-				worst = m
+			if vsFirst > maxShare {
+				maxShare = vsFirst
 			}
-			if worst > stillMaxMAD {
-				cmd.Process.Kill() // verdict reached; stop the decode
+			if vsPrev > stillNoiseShare {
+				moving++
+			}
+			if maxShare > stillMaxChangeShare {
+				cmd.Process.Kill() // decisive: some frame moves real content
 				done = true
 			}
 		}
@@ -169,10 +222,15 @@ func framesNearlyStill(ctx context.Context, ff, src string) (bool, error) {
 		}
 	}
 	werr := cmd.Wait()
-	if worst > stillMaxMAD {
+	if maxShare > stillMaxChangeShare {
 		return false, nil // decisive: there is motion
 	}
 	if frames < stillMinSamples {
+		return false, nil
+	}
+	// The sparsity verdict needs the whole clip, so it is checked only now:
+	// a single early change must not read as "half the video moved".
+	if moving*100 > frames*stillMaxMovingPercent {
 		return false, nil
 	}
 	if werr != nil {
@@ -181,30 +239,47 @@ func framesNearlyStill(ctx context.Context, ff, src string) (bool, error) {
 	return true, nil
 }
 
-// mad8 is the mean absolute pixel difference of two equal-length gray frames,
-// on the 0..255 scale.
-func mad8(a, b []byte) int {
-	if len(a) != len(b) {
-		return 256
+// changedShare is the percentage of pixels that differ by more than delta
+// between two equal-length gray frames.
+func changedShare(a, b []byte, delta int) float64 {
+	if len(a) != len(b) || len(a) == 0 {
+		return 100
 	}
-	sum := 0
+	n := 0
 	for i := range a {
 		d := int(a[i]) - int(b[i])
 		if d < 0 {
 			d = -d
 		}
-		sum += d
+		if d > delta {
+			n++
+		}
 	}
-	return sum / len(a)
+	return float64(n) * 100 / float64(len(a))
 }
 
 // --- witness 1: bitstream watchdog (pure Go, no decoding) ------------------
 
 // mp4Video is what the still detector needs from an MP4/MOV sample table.
 type mp4Video struct {
-	samples  int   // video-track sample count
-	maxInter int64 // largest inter (non-keyframe) sample size in bytes
-	duration float64
+	samples    int   // video-track sample count
+	interCount int   // inter (non-keyframe) sample count
+	interHeavy int   // inter samples at/above stillMaxPacket
+	maxInter   int64 // largest inter sample size, diagnostics only
+	duration   float64
+}
+
+// stillBitstream is witness 1: does the sample table look like one static
+// picture? Expensive packets must stay a small minority — a per-packet
+// maximum would be fooled by hidden reference frames (see the file comment).
+func (v mp4Video) stillBitstream() bool {
+	if v.samples < stillMinSamples {
+		return false
+	}
+	if v.interCount == 0 {
+		return true // no inter evidence at all: let the pixel witness decide
+	}
+	return v.interHeavy*100 <= v.interCount*stillHeavyPercent
 }
 
 // probeMP4Video walks the box tree (headers only, seeking over mdat) and
@@ -457,7 +532,7 @@ func parseStbl(f io.ReadSeeker, start, end int64, v *mp4Video) error {
 	// conservative reading (all-intra videos then fail the watchdog, as
 	// they should: their I-frames are big by nature).
 	v.samples = sampleCount
-	v.maxInter = 0
+	v.interCount, v.interHeavy, v.maxInter = 0, 0, 0
 	if sizes != nil { // per-sample table
 		si := 0
 		for i, s := range sizes {
@@ -471,6 +546,10 @@ func parseStbl(f io.ReadSeeker, start, end int64, v *mp4Video) error {
 				}
 			} else if i == 0 {
 				continue
+			}
+			v.interCount++
+			if int64(s) >= stillMaxPacket {
+				v.interHeavy++
 			}
 			if int64(s) > v.maxInter {
 				v.maxInter = int64(s)
@@ -486,6 +565,10 @@ func parseStbl(f io.ReadSeeker, start, end int64, v *mp4Video) error {
 			inter = sampleCount - 1
 		}
 		if inter > 0 {
+			v.interCount = inter
+			if int64(uniform) >= stillMaxPacket {
+				v.interHeavy = inter
+			}
 			v.maxInter = int64(uniform)
 		}
 	}

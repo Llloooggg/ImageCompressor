@@ -1236,10 +1236,13 @@ func (r *Runner) encodeSwap(ctx context.Context, path, rel, srcHash string, res 
 		return
 	}
 
-	// "Smaller — or we don't touch."
+	// "Smaller — or we don't touch" — EXCEPT for a hat: once the detector called
+	// this file a still picture, the picture is made regardless of size (user
+	// rule, canon rule 4). The frame of a hat was already squeezed by an AV1
+	// video pass, so its standalone AVIF is frequently bigger than the clip.
 	newInfo, _ := os.Stat(tmp)
 	origInfo, _ := os.Stat(path)
-	if newInfo != nil && origInfo != nil && newInfo.Size() >= origInfo.Size() {
+	if !still && newInfo != nil && origInfo != nil && newInfo.Size() >= origInfo.Size() {
 		safefs.RemoveIfExists(tmp)
 		if retried {
 			r.skipDone.Add(1) // re-confirming the journal's "nochange" under changed settings
@@ -1719,15 +1722,14 @@ func (r *Runner) achievedFor(k detect.Kind, v media.VideoResult, p media.PhotoRe
 	}
 }
 
-// hatNote marks a "not smaller" verdict that came from a video hat: the Kind
-// column says "image" (the collapse rewrites it), which would otherwise read as
-// if the file had always been a photo.
+// hatNote decorates the Comment of a journal row produced by a video hat: the
+// encoder trail gets the "hat: " prefix, so a Kind="image" row still reads as
+// "this was a video hat". Nothing else is invented there: a hat can never land
+// in the "not smaller" branch (the collapse does not bargain with size), and
+// the Action column already says "still collapsed".
 func hatNote(note string, still bool) string {
-	if !still {
+	if !still || note == "" {
 		return note
-	}
-	if note == "" {
-		return "hat: one kept frame not smaller than the clip"
 	}
 	return "hat: " + note
 }

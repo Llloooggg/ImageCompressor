@@ -3,6 +3,7 @@ package media
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,17 +14,21 @@ import (
 
 // --- pure tests: pixel metric ----------------------------------------------
 
-func TestMad8(t *testing.T) {
-	a := []byte{10, 20, 30, 40}
-	b := []byte{12, 18, 34, 40} // diffs: 2+2+4+0 = 8 / 4 = 2
-	if got := mad8(a, b); got != 2 {
-		t.Errorf("mad8 = %d, want 2", got)
+func TestChangedShare(t *testing.T) {
+	a := []byte{10, 20, 30, 40, 50}
+	b := []byte{12, 18, 45, 40, 10} // diffs: 2,2,15,0,40 -> two above 10
+	if got := changedShare(a, b, 10); got != 40 {
+		t.Errorf("changedShare = %v, want 40", got)
 	}
-	if got := mad8(a, []byte{10, 20, 30}); got != 256 {
-		t.Errorf("mad8 mismatched lengths = %d, want 256", got)
+	if got := changedShare(a, []byte{1, 2, 3}, 10); got != 100 {
+		t.Errorf("changedShare mismatched lengths = %v, want 100", got)
 	}
-	if got := mad8(a, a); got != 0 {
-		t.Errorf("mad8(same) = %d, want 0", got)
+	if got := changedShare(a, a, 10); got != 0 {
+		t.Errorf("changedShare(same) = %v, want 0", got)
+	}
+	// exactly at the delta is NOT a change (strictly greater)
+	if got := changedShare([]byte{10}, []byte{20}, 10); got != 0 {
+		t.Errorf("changedShare at delta = %v, want 0", got)
 	}
 }
 
@@ -120,6 +125,9 @@ func TestProbeMP4VideoPerSample(t *testing.T) {
 	if v.maxInter != 400 {
 		t.Errorf("maxInter = %d, want 400 (keyframes 1 and 4 excluded)", v.maxInter)
 	}
+	if v.interCount != 3 || v.interHeavy != 0 {
+		t.Errorf("interCount/interHeavy = %d/%d, want 3/0", v.interCount, v.interHeavy)
+	}
 	if v.duration != 4 {
 		t.Errorf("duration = %v, want 4", v.duration)
 	}
@@ -135,6 +143,9 @@ func TestProbeMP4VideoNoStssAllIntra(t *testing.T) {
 	if v.maxInter != 90 { // everything but sample 1 counts as inter
 		t.Errorf("maxInter = %d, want 90", v.maxInter)
 	}
+	if v.interCount != 2 || v.interHeavy != 0 {
+		t.Errorf("interCount/interHeavy = %d/%d, want 2/0", v.interCount, v.interHeavy)
+	}
 }
 
 func TestProbeMP4VideoUniform(t *testing.T) {
@@ -147,6 +158,9 @@ func TestProbeMP4VideoUniform(t *testing.T) {
 	if v.samples != 30 || v.maxInter != 350 {
 		t.Errorf("got samples=%d maxInter=%d, want 30/350", v.samples, v.maxInter)
 	}
+	if v.interCount != 27 || v.interHeavy != 0 {
+		t.Errorf("interCount/interHeavy = %d/%d, want 27/0", v.interCount, v.interHeavy)
+	}
 }
 
 func TestProbeMP4VideoFragmentedRejected(t *testing.T) {
@@ -157,14 +171,48 @@ func TestProbeMP4VideoFragmentedRejected(t *testing.T) {
 	}
 }
 
-func TestWatchdogRejectsBeforePixelPass(t *testing.T) {
-	// One fat inter sample: StillVideo must answer false even without any
-	// ffmpeg involvement (bitstream witness alone is enough to refuse).
+func TestWatchdogRejectsSustainedMotion(t *testing.T) {
+	// A hat-shaped table with a handful of expensive packets still passes
+	// (hidden refresh frames). Sustained motion — here 4 of 21 inter samples,
+	// ~19% of the timeline — must veto even before ffmpeg gets involved.
 	p := writeFakeMP4(t, append(mvhdSeconds(3),
-		trakVideo(stszSizes([]uint32{50000, 300, 300, 20000, 300}), stssList([]uint32{1, 3}))...))
+		trakVideo(stszSizes([]uint32{
+			50000, 200, 200, 20000, 200, 200, 20000, 200, 200, 20000,
+			200, 200, 20000, 200, 200, 200, 200, 200, 200, 200, 200, 200}),
+			stssList([]uint32{1}))...))
 	loc := tools.NewLocator()
 	if StillVideo(context.Background(), loc, p) {
-		t.Error("fat inter packet must veto collapse")
+		t.Error("sustained expensive inter packets must veto collapse")
+	}
+}
+
+func TestWatchdogToleratesRefreshSpikes(t *testing.T) {
+	// The shape of a real hat from the archive: 481 samples, 9 inter packets
+	// of ~56 KB (hidden reference frames), everything else tens to hundreds
+	// of bytes. A per-packet maximum used to reject exactly this file.
+	sizes := make([]uint32, 481)
+	for i := range sizes {
+		sizes[i] = 60
+	}
+	for _, i := range []int{177, 227, 277, 327, 377, 427, 447, 467, 477} {
+		sizes[i] = 56951
+	}
+	syncs := []uint32{1}
+	for s := uint32(121); s <= 481; s += 120 {
+		syncs = append(syncs, s)
+	}
+	p := writeFakeMP4(t, append(mvhdSeconds(16),
+		trakVideo(stszSizes(sizes), stssList(syncs))...))
+	v, err := probeMP4Video(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.interHeavy == 0 || v.interCount == 0 {
+		t.Fatalf("test table not built: heavy=%d inter=%d", v.interHeavy, v.interCount)
+	}
+	if !v.stillBitstream() {
+		t.Errorf("refresh spikes must not veto: heavy=%d inter=%d maxInter=%d",
+			v.interHeavy, v.interCount, v.maxInter)
 	}
 }
 
@@ -179,8 +227,9 @@ func TestWatchdogAcceptsTinyStatic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v.samples < stillMinSamples || v.maxInter >= stillMaxPacket {
-		t.Errorf("expected hat-shaped numbers, got samples=%d maxInter=%d", v.samples, v.maxInter)
+	if v.samples < stillMinSamples || !v.stillBitstream() {
+		t.Errorf("expected hat-shaped numbers, got samples=%d interHeavy=%d inter=%d",
+			v.samples, v.interHeavy, v.interCount)
 	}
 }
 
@@ -307,5 +356,66 @@ func TestCollapseStillEndToEnd(t *testing.T) {
 	pe, _ := filepath.Glob(filepath.Join(dir, ".mc-tmp-*.png"))
 	if len(pe) > 0 {
 		t.Errorf("PNG intermediates left behind: %v", pe)
+	}
+}
+
+// A hat is a picture whatever it costs (user rule, canon rule 4): it may not
+// decline on size even when the photo cannot possibly be smaller than its
+// source. origSize=1 makes that impossible by construction, so the photo path
+// must decline and the hat path must not.
+func TestCollapseStillNeverDeclinesOnSize(t *testing.T) {
+	loc, ff := testFFmpeg(t)
+	dir := t.TempDir()
+	hat := makeClip(t, ff, dir, "hat.mp4", "", "", true)
+	tmp := filepath.Join(dir, "out.avif")
+	res, err := CollapseStill(context.Background(), loc, Opts{PhotoQ: 85, PhotoSpeed: 6}, hat, tmp, 1, nil)
+	if errors.Is(err, ErrNotSmaller) {
+		t.Fatal("a hat must never decline on size, got ErrNotSmaller")
+	}
+	if err != nil {
+		t.Fatalf("collapse: %v", err)
+	}
+	st, err := os.Stat(tmp)
+	if err != nil || st.Size() == 0 {
+		t.Fatalf("no photo produced: %v", err)
+	}
+	if res.Q != 85 {
+		t.Errorf("achieved Q = %d, want the base 85 (no ladder for a hat)", res.Q)
+	}
+	if len(res.Attempts) != 1 {
+		t.Errorf("attempts = %v, want a single base-level encode", res.Attempts)
+	}
+}
+
+// The rule is opt-in: an ordinary photo still answers "smaller — or we leave it
+// alone", or every already-compressed photo in the archive would be rewritten.
+func TestEncodeImageDeclinesWithoutHatRule(t *testing.T) {
+	loc, ff := testFFmpeg(t)
+	dir := t.TempDir()
+	src := filepath.Join(dir, "x.png")
+	if b, err := exec.Command(ff, "-y", "-hide_banner", "-loglevel", "error",
+		"-f", "lavfi", "-i", "color=c=red:s=320x240:r=30", "-frames:v", "1", src).CombinedOutput(); err != nil {
+		t.Fatalf("build photo: %v\n%s", err, b)
+	}
+	ctx := context.Background()
+
+	plain := filepath.Join(dir, "plain.avif")
+	if _, err := EncodeImage(ctx, loc, Opts{PhotoQ: 85, PhotoSpeed: 6}, src, plain, 1, nil); !errors.Is(err, ErrNotSmaller) {
+		t.Errorf("plain photo with an impossible size target: err = %v, want ErrNotSmaller", err)
+	}
+	if _, err := os.Stat(plain); !os.IsNotExist(err) {
+		t.Error("a declined photo must not leave a temp behind")
+	}
+
+	hat := filepath.Join(dir, "hat.avif")
+	res, err := EncodeImage(ctx, loc, Opts{PhotoQ: 85, PhotoSpeed: 6, PhotoAcceptLarger: true}, src, hat, 1, nil)
+	if err != nil {
+		t.Fatalf("hat rule must accept the encode: %v", err)
+	}
+	if st, serr := os.Stat(hat); serr != nil || st.Size() == 0 {
+		t.Fatalf("no photo produced under the hat rule: %v", serr)
+	}
+	if res.Q != 85 || len(res.Attempts) != 1 {
+		t.Errorf("res = %+v, want base q85 in a single attempt", res)
 	}
 }

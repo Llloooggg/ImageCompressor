@@ -43,11 +43,17 @@ type Opts struct {
 	PhotoLoss    bool    // pixel-exact AVIF
 	PhotoSpeed   int     // avifenc --speed 0..10 (higher = faster, bigger; 6 = canon)
 	PhotoVMAFMin float64 // min acceptable VMAF for ESCALATED photo levels (0 disables the guard)
-	VideoCRF     int     // CRF floor of the ladder (escalation +6/+12, capped at 45)
-	VideoVMAFMin float64 // min acceptable VMAF for ESCALATED levels (0 disables the guard)
-	Encoder      string
-	CPUBudget    int // threads granted to each child encoder/vmaf (0 = codec default)
-	VideoPreset  int // SVT-AV1 preset (cpu-used for libaom), 0 = codec default
+	// PhotoAcceptLarger is the "hat" rule (user): the encode is kept even when it
+	// is NOT smaller than the source. A hat is a photo wearing a video costume,
+	// so the honest format and one picture in the gallery outweigh a few KB
+	// (battle case: 153 KB clip vs a 191 KB q85 frame). Only CollapseStill sets
+	// it; the ladder collapses to its base level and no guard is needed.
+	PhotoAcceptLarger bool
+	VideoCRF          int     // CRF floor of the ladder (escalation +6/+12, capped at 45)
+	VideoVMAFMin      float64 // min acceptable VMAF for ESCALATED levels (0 disables the guard)
+	Encoder           string
+	CPUBudget         int // threads granted to each child encoder/vmaf (0 = codec default)
+	VideoPreset       int // SVT-AV1 preset (cpu-used for libaom), 0 = codec default
 }
 
 // InspectDuration reads the container header via `ffmpeg -i` (headers only,
@@ -163,6 +169,8 @@ func PhotoLadder(base int) []int {
 // for a point that is BOTH smaller AND imperceptible. No such point -> the
 // file is left untouched (ErrNotSmaller): we never trade visible quality for
 // size. Lossless mode has no ladder (quality is fixed by definition).
+// The one exception is the hat rule (o.PhotoAcceptLarger, set by CollapseStill):
+// the base level is kept regardless of size — a hat is a picture, always.
 // progress (optional, may be nil) receives the ladder label (q85, q79, ...)
 // before each attempt so the live status slot shows the photo step too
 // (display consistency with video; a still frame has no timeline position).
@@ -171,7 +179,7 @@ func EncodeImage(ctx context.Context, loc *tools.Locator, o Opts, src, tmp strin
 	record := func(what string, d time.Duration) {
 		attempts = append(attempts, fmt.Sprintf("%s %.1fs", what, d.Seconds()))
 	}
-	attempt := func(q int, sfx string) (kept, ran bool, lastErr error, win string) {
+	attempt := func(q int, sfx string, acceptLarger bool) (kept, ran bool, lastErr error, win string) {
 		if progress != nil {
 			if o.PhotoLoss {
 				progress("lossless")
@@ -186,9 +194,9 @@ func EncodeImage(ctx context.Context, loc *tools.Locator, o Opts, src, tmp strin
 			return false, false, err, ""
 		}
 		ran = true // encoder produced a file successfully
-		if st, serr := os.Stat(tmp); serr == nil && st.Size() < origSize {
+		if st, serr := os.Stat(tmp); serr == nil && (st.Size() < origSize || acceptLarger) {
 			record(fmt.Sprintf("%s q%d kept", codecShort(tool), q), time.Since(t0))
-			return true, true, nil, tool // real win: keep tmp
+			return true, true, nil, tool // real win (or the hat rule): keep tmp
 		}
 		record(fmt.Sprintf("%s q%d nofit", codecShort(tool), q), time.Since(t0))
 		os.Remove(tmp) // ran fine but no reduction
@@ -205,10 +213,26 @@ func EncodeImage(ctx context.Context, loc *tools.Locator, o Opts, src, tmp strin
 		return s
 	}
 
-	if o.PhotoLoss {
-		kept, ran, err, win := attempt(o.PhotoQ, "")
+	// The "hat" rule (user): the frame becomes a picture whatever it costs — one
+	// base-level encode, kept even if it is bigger than the source clip. No
+	// ladder (nothing to escalate) and no VMAF guard (the base level is the
+	// user's quality order, it never needed one). ErrNotSmaller is unreachable
+	// here: any successful encode is kept.
+	if o.PhotoAcceptLarger {
+		kept, ran, err, win := attempt(o.PhotoQ, "", true)
 		if kept {
-			return PhotoResult{Q: o.PhotoQ, VMAF: -1, Codec: codecShort(win)}, nil
+			return PhotoResult{Q: o.PhotoQ, VMAF: -1, Codec: codecShort(win), Attempts: attempts}, nil
+		}
+		if !ran && err != nil {
+			return PhotoResult{Attempts: attempts}, err
+		}
+		return PhotoResult{Attempts: attempts}, ErrNotSmaller
+	}
+
+	if o.PhotoLoss {
+		kept, ran, err, win := attempt(o.PhotoQ, "", false)
+		if kept {
+			return PhotoResult{Q: o.PhotoQ, VMAF: -1, Codec: codecShort(win), Attempts: attempts}, nil
 		}
 		if !ran && err != nil {
 			return PhotoResult{Attempts: attempts}, err
@@ -224,7 +248,7 @@ func EncodeImage(ctx context.Context, loc *tools.Locator, o Opts, src, tmp strin
 		if len(ladder) > 1 { // ladder position for the live status (hidden when single-step)
 			sfx = fmt.Sprintf(" (%d/%d)", i+1, len(ladder))
 		}
-		kept, ran, err, win := attempt(lvl, sfx)
+		kept, ran, err, win := attempt(lvl, sfx, false)
 		anyRan = anyRan || ran
 		if err != nil {
 			lastErr = err
@@ -233,13 +257,13 @@ func EncodeImage(ctx context.Context, loc *tools.Locator, o Opts, src, tmp strin
 			continue
 		}
 		if i == 0 || o.PhotoVMAFMin <= 0 {
-			return PhotoResult{Q: lvl, VMAF: -1, Codec: codecShort(win)}, nil // base level: user's order; or guard disabled
+			return PhotoResult{Q: lvl, VMAF: -1, Codec: codecShort(win), Attempts: attempts}, nil // base level: user's order; or guard disabled
 		}
 		if progress != nil {
 			progress(fmt.Sprintf("q%d%s vmaf", lvl, sfx)) // encode done, the metric pass runs
 		}
 		if s := score(); s < 0 || s >= o.PhotoVMAFMin {
-			return PhotoResult{Q: lvl, VMAF: s, Codec: codecShort(win)}, nil // passed the floor (no metric -> honest fallback)
+			return PhotoResult{Q: lvl, VMAF: s, Codec: codecShort(win), Attempts: attempts}, nil // passed the floor (no metric -> honest fallback)
 		}
 		// Smaller but visibly worse: bisect between this q (small, visible)
 		// and the previous higher q (invisible, but it did not shrink).
@@ -250,7 +274,7 @@ func EncodeImage(ctx context.Context, loc *tools.Locator, o Opts, src, tmp strin
 			if mid <= lo || mid >= hi {
 				break
 			}
-			k2, ran2, e2, win2 := attempt(mid, " (bis)")
+			k2, ran2, e2, win2 := attempt(mid, " (bis)", false)
 			anyRan = anyRan || ran2
 			if e2 != nil {
 				lastErr = e2
@@ -263,7 +287,7 @@ func EncodeImage(ctx context.Context, loc *tools.Locator, o Opts, src, tmp strin
 				progress(fmt.Sprintf("q%d (bis) vmaf", mid))
 			}
 			if s2 := score(); s2 < 0 || s2 >= o.PhotoVMAFMin {
-				return PhotoResult{Q: mid, VMAF: s2, Codec: codecShort(win2)}, nil // both smaller and imperceptible
+				return PhotoResult{Q: mid, VMAF: s2, Codec: codecShort(win2), Attempts: attempts}, nil // both smaller and imperceptible
 			}
 			os.Remove(tmp)
 			lo = mid // smaller but visible: pull quality back up

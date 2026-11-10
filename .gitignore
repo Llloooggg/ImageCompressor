@@ -13,6 +13,10 @@
 internal/assets/tools/windows/*
 !internal/assets/tools/windows/README.txt
 
+# one-time archive maintenance helpers: they reuse the library, but are NOT part
+# of the shipped software and must never be committed (like journalcheck/gapfix)
+/cmd/hataudit/
+
 # tool runtime artifacts (these live in the user's archive, never in the repo)
 image_compressor.db
 image_compressor.db-wal
