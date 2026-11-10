@@ -80,13 +80,18 @@ func (l *Locator) findBundled(exe string) string {
 	if l.cwdDir != "" && l.cwdDir != l.exeDir {
 		bases = append(bases, filepath.Join(l.cwdDir, "tools"), filepath.Join(l.cwdDir, "bin"))
 	}
-	// embedded (extracted to temp) as the last bundled source — this is what
-	// makes the single .exe self-contained for avifenc/exiftool.
-	if e := l.embedded(); e != "" {
-		bases = append(bases, e)
-	}
 	for _, b := range bases {
 		p := filepath.Join(b, exe)
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			return p
+		}
+	}
+	// Embedded (extracted to temp) as the last bundled source — this is what
+	// makes the single .exe self-contained for avifenc/exiftool. Materialize it
+	// only when nothing on disk matched: unpacking the 200+ MB tree just to
+	// find a tools/ copy beside the exe is pure waste.
+	if e := l.embedded(); e != "" {
+		p := filepath.Join(e, exe)
 		if st, err := os.Stat(p); err == nil && !st.IsDir() {
 			return p
 		}
